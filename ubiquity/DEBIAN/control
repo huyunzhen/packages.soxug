@@ -1,0 +1,12 @@
+Package: ubiquity-slideshow-os-xug
+Version: 65-2
+Architecture: all
+Maintainer: CIXUG Developers
+Conflicts: ubiquity-slideshow
+Replaces: ubiquity-slideshow
+Provides: ubiquity-slideshow
+Section: x11
+Priority: optional
+Description: Ubiquity slideshow for OS.xug
+ A slideshow intended for the Ubiquity installer, designed as a quick
+ introduction to Ubuntu.xug.
