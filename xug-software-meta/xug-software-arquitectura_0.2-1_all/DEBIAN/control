@@ -1,0 +1,12 @@
+Package: xug-software-arquitectura
+Source: xug-software-meta
+Version: 0.2-1
+Architecture: all
+Maintainer: CIXUG Developers <osl@cixug.es>
+Installed-Size: 25
+Depends: freecad, librecad, qcad
+Section: metapackage
+Priority: optional
+Description: Metapackage with apps and tools for Architecture Science
+ This package installs all the needed software on the
+ Faculty of Architecture Science of all the Universities of Galicia

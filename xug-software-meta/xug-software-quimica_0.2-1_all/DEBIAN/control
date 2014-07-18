@@ -1,0 +1,12 @@
+Package: xug-software-quimica
+Source: xug-software-meta
+Version: 0.2-1
+Architecture: all
+Maintainer: CIXUG Developers <osl@cixug.es>
+Installed-Size: 25
+Depends: avogadro, ballview, gabedit, gnuplot, gromacs, imagej, pymol, r-cran-coda, r-cran-diagnosismed, r-cran-epi, r-cran-epibasix, r-cran-gmaps, r-cran-lme4, r-cran-maps, r-cran-maptools, r-cran-rcmdr, r-cran-rjava, r-cran-rodbc, rasmol, rkward, scidavis
+Section: metapackage
+Priority: optional
+Description: Metapackage with apps and tools for Chemistry Science
+ This package installs all the needed software on the
+ Faculty of Chemistry Science of all the Universities of Galicia

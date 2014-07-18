@@ -1,0 +1,12 @@
+#!/bin/sh
+
+case "$1" in
+    remove|purge)
+		#if [ -e /etc/lightdm/lightdm.conf ]; then
+		#	sed -i "s/user-session.*/user-session=ubuntu/g" /etc/lightdm/lightdm.conf
+		#fi
+
+		/usr/lib/lightdm/lightdm-set-defaults --session ubuntu
+        ;;
+esac
+

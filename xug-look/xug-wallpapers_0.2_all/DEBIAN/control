@@ -1,0 +1,12 @@
+Package: xug-wallpapers
+Source: xug-look
+Version: 0.2
+Architecture: all
+Maintainer: CIXUG Developers <osl@cixug.es>
+Installed-Size: 11918
+Section: x11
+Priority: optional
+Description: Ubuntu.xug - Wallpapers
+ The Ubuntu.xug theme.
+ .
+ This package contains the USC Wallpapers.

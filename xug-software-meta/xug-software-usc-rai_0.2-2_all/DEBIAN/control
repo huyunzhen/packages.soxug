@@ -1,0 +1,13 @@
+Package: xug-software-usc-rai
+Source: xug-software-meta
+Version: 0.2-2
+Architecture: all
+Maintainer: CIXUG Developers <osl@cixug.es>
+Installed-Size: 26
+Depends: firestarter, gnome-network-admin, nfs-common, openssh-blacklist, openssh-blacklist-extra, openssh-client, openssh-server, quota
+Recommends: ethtool
+Section: metapackage
+Priority: optional
+Description: Metapackage that contains tools for RAI network of USC
+ This package installs all the needed software on the
+ RAI network of University of Santiago de Compostela

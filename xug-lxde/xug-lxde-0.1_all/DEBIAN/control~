@@ -1,0 +1,11 @@
+Package: xug-keyring
+Version: 0.1
+Architecture: all
+Maintainer: CIXUG Developers <osl@cixug.es>
+Installed-Size: 31
+Depends: lubuntu-desktop
+Section: misc
+Priority: optional
+Description: Instala el gestor lubuntu-desktop (LXDE), y
+ lo configura por defecto para los usuarios que no hayan
+ iniciado sesión todavía en el equipo.

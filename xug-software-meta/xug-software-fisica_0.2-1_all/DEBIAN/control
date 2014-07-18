@@ -1,0 +1,12 @@
+Package: xug-software-fisica
+Source: xug-software-meta
+Version: 0.2-1
+Architecture: all
+Maintainer: CIXUG Developers <osl@cixug.es>
+Installed-Size: 25
+Depends: build-essential, elyxer, gfortran, gfortran-doc, gfortran-multilib, lyx, octave, pspp, qtoctave, rkward
+Section: metapackage
+Priority: optional
+Description: Metapackage with apps and tools for Physics Science
+ This package installs all the needed software on the
+ Faculty of Physics Science of all the Universities of Galicia

@@ -1,0 +1,15 @@
+Package: xug-software-base
+Source: xug-meta
+Version: 0.9
+Architecture: i386
+Maintainer: Oficina de Software Libre da USC <osl@usc.es>
+Installed-Size: 25
+Depends: gimp, gimp-data-extras, inkscape, libreoffice-pdfimport, libreoffice-presentation-minimizer, libreoffice-presenter-console, preload, ttf-liberation, ttf-radisnoir, vlc, vorbis-tools
+Recommends: acroread, acroread-fonts, libdvdcss2, libdvdread4, p7zip, totem-mozilla, ttf-droid, ttf-randisnoir, ubuntu-restricted-extras, unrar, w32codecs
+Section: metapackages
+Priority: optional
+Description: The XUG desktop system
+ This package depends on all of the packages in the xug desktop system
+ .
+ It is also used to help ensure proper upgrades, so it is recommended that
+ it not be removed.

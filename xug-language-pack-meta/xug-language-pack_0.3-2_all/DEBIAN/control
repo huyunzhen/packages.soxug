@@ -1,0 +1,12 @@
+Package: xug-language-pack
+Source: xug-language-pack-meta
+Version: 0.3-2
+Architecture: all
+Maintainer: CIXUG Developers <osl@cixug.es>
+Installed-Size: 25
+Depends: hunspell-gl-es, language-pack-es, language-pack-es-base, language-pack-gl, language-pack-gl-base, language-pack-gnome-es-base, language-pack-gnome-gl, language-pack-gnome-gl-base, wgalician-minimos, wspanish
+Section: translations
+Priority: optional
+Description: CIXUG language metapackage
+ This package contains the a bunch of language translations for
+ Galician language.

@@ -1,0 +1,13 @@
+Package: xug-software-filoloxia
+Source: xug-software-meta
+Version: 0.2-1
+Architecture: all
+Maintainer: CIXUG Developers <osl@cixug.es>
+Installed-Size: 25
+Depends: aconcorde, apertium, apertium-en-es, apertium-es-gl, apertium-es-pt, apertium-fr-es, apertium-pt-gl, apertium-tolk, gaupol, gnome-subtitles, gtranslator, kompozer, link-grammar, lokalize, nltk, omegat, omegat-plugin-tokenizer, poedit, praat, scribus, stardict, stardict-common, stardict-tools, subtitleeditor, texmaker, textstat, treetagger, virtaal, wordnet
+Recommends: agfl, freeling, mmorph
+Section: metapackage
+Priority: optional
+Description: Metapackage with apps and tools for Computer Science
+ This package installs all the needed software on the
+ Faculty of Philoloy Science of all the Universities of Galicia

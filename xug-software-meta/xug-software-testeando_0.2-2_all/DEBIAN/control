@@ -1,0 +1,11 @@
+Package: xug-software-testeando
+Source: xug-software-meta
+Version: 0.2-2
+Architecture: all
+Maintainer: Myself <myself@myself.com>
+Installed-Size: 26
+Depends: audacity, pidgin, octave, dia
+Section: metapackage
+Priority: optional
+Description: Metapackage for testing purposes
+ Do not download. Not needed.

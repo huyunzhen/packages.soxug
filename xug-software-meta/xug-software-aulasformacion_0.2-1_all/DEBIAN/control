@@ -1,0 +1,12 @@
+Package: xug-software-aulasformacion
+Source: xug-software-meta
+Version: 0.2-1
+Architecture: all
+Maintainer: CIXUG Developers <osl@cixug.es>
+Installed-Size: 25
+Depends: enigmail, freemind, gretl, gtranslator, maxima, maxima-doc, maxima-share, octave, omegat, qtoctave, rkward, thunderbird, thunderbird-gnome-support, thunderbird-locale-es, thunderbird-locale-gl, virtualbox | virtualbox-ose
+Section: metapackage
+Priority: optional
+Description: Metapackage with apps and tools for Formational labs
+ This package installs all the needed software on the
+ Formational labs of all the Universities of Galicia

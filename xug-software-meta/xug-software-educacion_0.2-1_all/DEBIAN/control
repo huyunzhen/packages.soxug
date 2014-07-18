@@ -1,0 +1,12 @@
+Package: xug-software-educacion
+Source: xug-software-meta
+Version: 0.2-1
+Architecture: all
+Maintainer: CIXUG Developers <osl@cixug.es>
+Installed-Size: 25
+Depends: audacity, audacity-data, dia, ezgo-education, freemind, gcompris, geogebra, geogebra-gnome, gimp, gimp-data-extras, inkscape, jclic, kompozer, p7zip-full, pspp, rkward, squeak, vlc, xmind
+Section: metapackage
+Priority: optional
+Description: Metapackage with apps and tools for Education Science
+ This package installs all the needed software on the
+ Faculty of Education Science of all the Universities of Galicia

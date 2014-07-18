@@ -1,0 +1,10 @@
+Package: xug-keyring
+Version: 0.2-0
+Architecture: all
+Maintainer: CIXUG Developers <osl@cixug.es>
+Installed-Size: 31
+Recommends: gnupg (>= 1.0.6-4)
+Section: misc
+Priority: optional
+Description: GnuPG keys of XUG Debian/Ubuntu Packages
+ This package contains keyrings of GnuPG keys of CIXUG.

@@ -1,0 +1,12 @@
+Package: xug-software-bioestatistica
+Source: xug-software-meta
+Version: 0.2-1
+Architecture: all
+Maintainer: CIXUG Developers <osl@cixug.es>
+Installed-Size: 25
+Depends: bibus, epigrass, extrema, freemat, gretl, maxima, med-epi, octave, pspp, qtoctave, r-base, r-cran-bayesm, r-cran-coda, r-cran-diagnosismed, r-cran-epi, r-cran-epibasix, r-cran-epir, r-cran-gmaps, r-cran-lme4, r-cran-maps, r-cran-maptools, r-cran-rcmdr, r-cran-rjava, r-cran-rocr, r-cran-rodbc, r-cran-surveillance, r-mathlib, revolution-r, rkward, scilab, wxmaxima
+Section: metapackage
+Priority: optional
+Description: Metapackage with apps and tools for Biostatistic studies
+ This package installs all the needed software on the
+ Biostatistics studies

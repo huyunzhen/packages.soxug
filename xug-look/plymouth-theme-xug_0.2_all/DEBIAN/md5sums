@@ -1,0 +1,16 @@
+9b77c2eb035623599e53ba00191c5942  lib/plymouth/themes/xug-logo/password_field.png
+cacc232b5501b26dce8051d0a22bee97  lib/plymouth/themes/xug-logo/password_field16.png
+d1d5bfc381d476d8b6d171cf257f0e7b  lib/plymouth/themes/xug-logo/progress_dot_off.png
+02cbe30ce3dae82eaade728e254eea77  lib/plymouth/themes/xug-logo/progress_dot_off16.png
+edc876b3fda8662fac82cb05945ce530  lib/plymouth/themes/xug-logo/progress_dot_on.png
+5f00519455dd1a7b03dd0bb53cb6f531  lib/plymouth/themes/xug-logo/progress_dot_on16.png
+d4e00e2b50d019dbd494dab727dec2d6  lib/plymouth/themes/xug-logo/ubuntu-logo.grub
+ca6c59ce650a0fa71e1ddf8e13cbcc5f  lib/plymouth/themes/xug-logo/ubuntu_logo.png
+d2f5908475bbdb9cd31741d992aff4d5  lib/plymouth/themes/xug-logo/ubuntu_logo16.png
+35fb53163ef2f9761a31337d3daad115  lib/plymouth/themes/xug-logo/xug-logo.plymouth
+985585bc39dd091775406acefefff41e  lib/plymouth/themes/xug-logo/xug-logo.script
+604920bdfb2c3fdd05db1e68d8765681  lib/plymouth/themes/xug-text/ubuntu-text.plymouth
+a871428528724837c1b01ac2b369db78  lib/plymouth/themes/xug-text/ubuntu-text.plymouth.in
+58908e56fbbcac2449ecf13059d14cbf  usr/share/doc/plymouth-theme-xug/AUTHORS
+354626140d3dfb2fa4c7e4b71b5f1629  usr/share/doc/plymouth-theme-xug/changelog.gz
+0ba42616d8127aa7cd9026e61f08f3c7  usr/share/doc/plymouth-theme-xug/copyright

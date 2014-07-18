@@ -1,0 +1,7 @@
+#!/bin/sh
+
+#if [ -e /etc/lightdm/lightdm.conf ]; then
+#      sed -i "s/user-session.*/user-session=lxde/g" /etc/lightdm/lightdm.conf
+#fi
+
+/usr/lib/lightdm/lightdm-set-defaults --session LXDE

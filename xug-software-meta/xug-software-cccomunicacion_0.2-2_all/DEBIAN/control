@@ -1,0 +1,12 @@
+Package: xug-software-cccomunicacion
+Source: xug-software-meta
+Version: 0.2-2
+Architecture: all
+Maintainer: CIXUG Developers <osl@cixug.es>
+Installed-Size: 27
+Depends: ardour, audacity, audacity-data, blender, blender-ogrexml, freecad, gimp, gimp-data-extras, inkscape, kdenlive, libogre-dev, libogre-perl, librecad, lmms, luciole, ogre-doc, ogre-samples, ogre-samples-data, ogre-samples-dbg, ogre-tools, openshot, qcad, scribus, stopmotion, yafaray
+Section: metapackage
+Priority: optional
+Description: Metapackage with apps and tools for Comunication Science
+ This package installs all the needed software on the
+ Faculty of Comunications Science of all the Universities of Galicia

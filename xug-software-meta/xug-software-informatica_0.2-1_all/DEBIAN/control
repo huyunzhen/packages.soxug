@@ -1,0 +1,13 @@
+Package: xug-software-informatica
+Source: xug-software-meta
+Version: 0.2-1
+Architecture: all
+Maintainer: CIXUG Developers <osl@cixug.es>
+Installed-Size: 25
+Depends: anjuta, audacity, autoconf, automake, bison, blender, build-essential, clisp, clisp-dev, clisp-doc, denim, eclipse, emacs, flex, g++, g++-multilib, gcc-multilib, gedit, gfortran, gfortran-multilib, gimp, git-core, gnupg-agent, jflap, kcachegrind, kvm, libjade-java, libjini-java, libjms-java, libjxta-java, libopenmpi-dev, libpam-ldap, libtool, lyx, manpages-dev, manpages-posix, manpages-posix-dev, maxima, mercurial, nano, netbeans, octave, octave-symbolic, openjdk-7-demo, openjdk-7-doc, openjdk-7-jdk, openjdk-7-jre, openmpi-bin, openssl, postgresql-client, qdevelop, qemu, qemu-launcher, qemuctl, qemulator, qtoctave, rkward, scilab, simula3ms, simulacache, subversion, subversion-tools, texlive-full, tortoisehg, umbrello, valgrind, vim, virt-manager, visualboyadvance, weka, wine, wine-gecko, wireshark, wxmaxima, zenmap
+Recommends: chipmunk, virtualbox | virtualbox-ose
+Section: metapackage
+Priority: optional
+Description: Metapackage with apps and tools for Computer Science
+ This package installs all the needed software on the
+ Faculty of Computer Science of all the Universities of Galicia
