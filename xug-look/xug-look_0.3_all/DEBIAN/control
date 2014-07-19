@@ -1,0 +1,16 @@
+Package: xug-look
+Version: 0.3
+Architecture: all
+Maintainer: CIXUG Developers <osl@cixug.es>
+Installed-Size: 40
+Depends: xug-wallpapers, plymouth-theme-xug
+Conflicts: xug-artwork, xug-look (<= 0.12)
+Replaces: xug-artwork, xug-look (<= 0.12)
+Section: metapackages
+Priority: optional
+Description: Ubuntu.xug look and feel
+ The Ubuntu.xug theme.
+ .
+ This package depends upon the constituent parts of the Ubuntu.xug theme,
+ whilst also providing the theme descriptor to the GNOME desktop, and the
+ distributor logo.
