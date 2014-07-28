@@ -1,0 +1,467 @@
+#!/bin/sh
+RPM_INSTALL_PREFIX=
+export RPM_INSTALL_PREFIX
+# summary of how this script can be called:
+#        * <postinst> `configure' <most-recently-configured-version>
+#        * <old-postinst> `abort-upgrade' <new version>
+#        * <conflictor's-postinst> `abort-remove' `in-favour' <package>
+#          <new-version>
+#        * <postinst> `abort-remove'
+#        * <deconfigured's-postinst> `abort-deconfigure' `in-favour'
+#          <failed-install-package> <version> `removing'
+#          <conflicting-package> <version>
+# for details, see http://www.debian.org/doc/debian-policy/ or
+# the debian-policy package
+
+# action plan:
+#        * <postinst> `configure' <most-recently-configured-version>
+#          - finish upgrade and configure
+#        * <old-postinst> `abort-upgrade' <new version>
+#          - (proceed other 'postrm abort-upgrade', unknown state) do nothing
+#        * <conflictor's-postinst> `abort-remove' `in-favour' <package>
+#          <new-version>
+#          - (unwind our 'prerm remove') do nothing
+#        * <postinst> `abort-remove'
+#          - (unwind our 'prerm remove') do nothing
+#        * <deconfigured's-postinst> `abort-deconfigure' `in-favour'
+#          <failed-install-package> <version> `removing'
+#          <conflicting-package> <version>
+#          - (unwind our 'prerm deconfigure') do nothing
+
+LOG_FILE=/var/log/centrifydc-install.log
+echo post-install: 5.1.3-482: `date` >> ${LOG_FILE}
+echo "arguments:" "$@" >> ${LOG_FILE}
+
+TRUE=0
+FALSE=1
+
+if [ "$1" = "configure" ]; then
+    # Configure or finish upgrade
+
+    # Create symlink for dz commands
+    for DZ_CMD in dzdo dzedit ; do
+        if [ ! -e "/usr/bin/$DZ_CMD" -a ! -h "/usr/bin/$DZ_CMD" ]; then
+            # Not there
+            echo "creating /usr/bin/$DZ_CMD symlink ..." >> ${LOG_FILE}
+            ln -s "/usr/share/centrifydc/bin/$DZ_CMD" "/usr/bin/$DZ_CMD"
+        fi
+    done
+
+    # Old addns may leave lock file there
+    rm -f /tmp/addns.lock
+
+    if [ -f /etc/shells ]; then
+        grep "\/usr\/bin\/dzsh" /etc/shells > /dev/null
+        if [ $? -ne 0 ]; then
+            echo adding /usr/bin/dzsh to /etc/shells ... >> ${LOG_FILE}
+            echo /usr/bin/dzsh >> /etc/shells
+        fi
+    fi
+
+    # Update /etc/lightdm/lightdm.conf to allow login as other user
+    if [ -f /etc/lightdm/lightdm.conf ]; then
+        if grep '\[SeatDefaults\]' /etc/lightdm/lightdm.conf > /dev/null ; then
+            if ! sed -n '/\[SeatDefaults\]/,/\]/p' /etc/lightdm/lightdm.conf |\
+                grep '^[ 	]*greeter-show-manual-login[ 	]*=[ 	]*true[ 	]*$' > /dev/null ; then
+                echo "Updating greeter-show-manual-login to true in /etc/lightdm/lightdm.conf ..." >> ${LOG_FILE}
+                
+                # Save the original file
+                cp -p /etc/lightdm/lightdm.conf /etc/lightdm/lightdm.conf.pre_cdc 2>> ${LOG_FILE} || true
+                # Copy to preserve file ownership and permissions
+                cp -pf /etc/lightdm/lightdm.conf /etc/lightdm/lightdm.conf.tmp
+                # Remove the line if exists, add our new setting,
+                # then replace the file
+                sed -e '/\[SeatDefaults\]/,/\]/{/^[ 	]*greeter-show-manual-login[ 	]*=.*$/d}' -e '/\[SeatDefaults\]/a\greeter-show-manual-login=true' /etc/lightdm/lightdm.conf > /etc/lightdm/lightdm.conf.tmp 2>> ${LOG_FILE} || true
+                mv -f /etc/lightdm/lightdm.conf.tmp /etc/lightdm/lightdm.conf 2>> ${LOG_FILE} || true
+            fi
+        else
+            echo "Do not know how to update /etc/lightdm/lightdm.conf" >> ${LOG_FILE}
+        fi
+    fi
+
+    # Handle Upstart service if Upstart exists and
+    # common services are included in Upstart
+    HAVE_NORMAL_UPSTART=$FALSE
+    IS_UPSTART_RUNNING=$FALSE
+    if [ -x "`which initctl 2>/dev/null`" -a -f "/etc/init/network-interface.conf" ]; then
+        echo "Need to support upstart" >> ${LOG_FILE}
+        HAVE_NORMAL_UPSTART=$TRUE
+        initctl version > /dev/null 2>&1 && IS_UPSTART_RUNNING=$TRUE
+    fi
+
+    # Copy Upstart service file
+    if [ "$HAVE_NORMAL_UPSTART" = "$TRUE" ]; then
+        echo "Copying upstart service file ..." >> ${LOG_FILE}
+        cp -p /usr/share/centrifydc/etc/upstart/centrifydc.conf /etc/init >> ${LOG_FILE} 2>&1
+        cp -p /usr/share/centrifydc/etc/upstart/centrify-kcm.conf /etc/init >> ${LOG_FILE} 2>&1
+    fi
+fi
+
+if [ "$1" = "configure" -a -z "$2" ]; then
+    # Configure
+
+    if [ "$IS_UPSTART_RUNNING" = "$TRUE" ]; then
+        echo "centrifydc upstart service is enabled" >> ${LOG_FILE}
+    else
+        update-rc.d centrifydc defaults 19 > /dev/null 2> /dev/null
+        update-rc.d centrify-kcm stop 80 0 1 6 . > /dev/null 2> /dev/null
+    fi
+
+    mkdir -p /var/centrifydc >> ${LOG_FILE}
+    chmod 755 /var/centrifydc >> ${LOG_FILE}
+
+    echo "Set licensed mode" >> ${LOG_FILE}
+    /usr/bin/adlicense --licensed >> ${LOG_FILE} 2>> ${LOG_FILE}
+
+    echo Centrify DirectControl has been successfully installed. >> ${LOG_FILE}
+fi
+
+if [ "$1" = "configure" -a -n "$2" ]; then
+    # Finish upgrade
+
+    echo upgrading to 5.1.3-482 ... >> ${LOG_FILE}
+
+    # Remove old sysvinit symlinks if Upstart is running
+    if [ "$IS_UPSTART_RUNNING" = "$TRUE" ]; then
+        echo "Removing old sysvinit symlinks ..." >> ${LOG_FILE}
+        update-rc.d -f centrifydc remove >> ${LOG_FILE} 2>&1
+        if [ -f /etc/init.d/centrify-kcm ]; then
+            update-rc.d -f centrify-kcm remove >> ${LOG_FILE} 2>&1
+        fi
+    fi
+
+    if [ "`uname -m`" = "x86_64" ]; then
+        ### replacing lib64 dir with symlink to lib
+        if [ -h /usr/share/centrifydc/lib64 ]; then
+            if [ "`readlink /usr/share/centrifydc/lib64`" = "lib" ]; then
+                ls -l /usr/share/centrifydc/lib64 >> ${LOG_FILE}
+            else
+                echo Fixing /usr/share/centrifydc/lib64 symbolic link ... >> ${LOG_FILE}
+                ls -l /usr/share/centrifydc/lib64 >> ${LOG_FILE}
+                ( cd /usr/share/centrifydc; rm lib64; ln -s lib lib64 )
+                ls -l /usr/share/centrifydc/lib64 >> ${LOG_FILE}
+            fi
+        else
+            echo Removing /usr/share/centrifydc/lib64 ... >> ${LOG_FILE}
+            rmdir /usr/share/centrifydc/lib64 2>> ${LOG_FILE}
+            if [ "$?" != "0" ]; then
+                echo -e "\nWARNING: Could not remove /usr/share/centrifydc/lib64" | tee -a ${LOG_FILE}
+                ls -l /usr/share/centrifydc/lib64 >> ${LOG_FILE}
+                echo Moving to /usr/share/centrifydc/lib64.old | tee -a ${LOG_FILE}
+                mv /usr/share/centrifydc/lib64 /usr/share/centrifydc/lib64.old
+            fi
+            echo Creating /usr/share/centrifydc/lib64 symbolic link ... >> ${LOG_FILE}
+            ( cd /usr/share/centrifydc; ln -s lib lib64 )
+            ls -l /usr/share/centrifydc/lib64 >> ${LOG_FILE}
+        fi
+
+        if [ -h /usr/share/centrifydc/kerberos/lib64 ]; then
+            if [ "`readlink /usr/share/centrifydc/kerberos/lib64`" = "lib" ]; then
+                ls -l /usr/share/centrifydc/kerberos/lib64 >> ${LOG_FILE}
+            else
+                echo Fixing /usr/share/centrifydc/kerberos/lib64 symbolic link ... >> ${LOG_FILE}
+                ls -l /usr/share/centrifydc/kerberos/lib64 >> ${LOG_FILE}
+                ( cd /usr/share/centrifydc/kerberos; rm lib64; ln -s lib lib64 )
+                ls -l /usr/share/centrifydc/kerberos/lib64 >> ${LOG_FILE}
+            fi
+        else
+            echo Removing /usr/share/centrifydc/kerberos/lib64 ... >> ${LOG_FILE}
+            rmdir /usr/share/centrifydc/kerberos/lib64 2>> ${LOG_FILE}
+            if [ "$?" != "0" ]; then
+                echo -e "\nWARNING: Could not remove /usr/share/centrifydc/kerberos/lib64" | tee -a ${LOG_FILE}
+                ls -l /usr/share/centrifydc/kerberos/lib64 >> ${LOG_FILE}
+                echo Moving to /usr/share/centrifydc/kerberos/lib64.old | tee -a ${LOG_FILE}
+                mv /usr/share/centrifydc/kerberos/lib64 /usr/share/centrifydc/kerberos/lib64.old
+            fi
+            echo Creating /usr/share/centrifydc/kerberos/lib64 symbolic link ... >> ${LOG_FILE}
+            ( cd /usr/share/centrifydc/kerberos; ln -s lib lib64 )
+            ls -l /usr/share/centrifydc/kerberos/lib64 >> ${LOG_FILE}
+        fi
+    fi
+
+    mkdir -p /etc/centrifydc/new >> ${LOG_FILE}
+    mv -f /etc/centrifydc/centrifydc.conf /etc/centrifydc/new >> ${LOG_FILE}
+    mv -f /etc/centrifydc/group.ignore /etc/centrifydc/new >> ${LOG_FILE}
+    mv -f /etc/centrifydc/user.ignore /etc/centrifydc/new >> ${LOG_FILE}
+
+    # Original CDC version
+    CDC_VER_ORIG=""
+    # Add http to adclient.krb5.service.principals if the original version less than 4.2.0
+    if [ -s /var/centrifydc/upgrade/CDC_VER_ORIG ]; then
+        CDC_VER_ORIG="`cat /var/centrifydc/upgrade/CDC_VER_ORIG | sed 's/[^0-9]*//g'`" # short format
+        if [ -n "${CDC_VER_ORIG}" ]; then
+            if [ "${CDC_VER_ORIG}" -lt "420000" ]; then
+                # Enable adclient.krb5.service.principals in new centrifydc.conf.
+                # So that the http can be merged to original centrifydc.conf
+                NEWCDCCONF="/etc/centrifydc/new/centrifydc.conf"
+                TMPCDCCONF="${NEWCDCCONF}.tmp"
+                sed 's/##*[ ]*\(adclient\.krb5\.service\.principals.*\)/\1/g' ${NEWCDCCONF} > ${TMPCDCCONF} 2>> ${LOG_FILE}
+                mv -f ${TMPCDCCONF} ${NEWCDCCONF} 2>> ${LOG_FILE}
+            fi
+        fi
+    fi
+
+    # Auto.schema.name.lower is a new option. Set it to false because we are upgrading.
+    grep 'auto.schema.name.lower' \
+        /etc/centrifydc/custom/centrifydc.conf > /dev/null 2>&1
+    if [ "$?" -ne "0" ]; then
+        echo "Set auto.schema.name.lower to false" >> ${LOG_FILE}
+        sed -e '/# auto.schema.name.lower/ {
+            a\ auto.schema.name.lower: false
+            }' -i.bak /etc/centrifydc/new/centrifydc.conf 2>> ${LOG_FILE}
+
+        # Remove the backup file created by sed
+        rm -f /etc/centrifydc/new/centrifydc.conf.bak
+    fi
+    
+    # Preserve licensed mode if upgrade from 4.4.0 lower
+    if [ -n "${CDC_VER_ORIG}" -a "${CDC_VER_ORIG}" -lt "440000" ]; then
+        echo "Preserve licensed mode" >> ${LOG_FILE}
+        /usr/bin/adlicense --licensed >> ${LOG_FILE} 2>> ${LOG_FILE}
+    fi
+    
+    /usr/share/centrifydc/bin/upgradeconf -r -c /etc/centrifydc/upgradeconf.conf \
+                                             /etc/centrifydc/custom/centrifydc.conf \
+                                             /etc/centrifydc/new/centrifydc.conf \
+                                             /etc/centrifydc/centrifydc.conf \
+                                             >> ${LOG_FILE} 2>> ${LOG_FILE}
+    if [ ! -s /etc/centrifydc/group.ignore ]; then
+        echo "Restoring group.ignore from /etc/centrifydc/custom/ ..."  | tee -a ${LOG_FILE}
+        cp -pf /etc/centrifydc/custom/group.ignore /etc/centrifydc/
+    fi
+    if [ ! -s /etc/centrifydc/user.ignore ]; then
+        echo "Restoring user.ignore from /etc/centrifydc/custom/ ..."  | tee -a ${LOG_FILE}
+        cp -pf /etc/centrifydc/custom/user.ignore /etc/centrifydc/
+    fi
+    
+    # While version older than 4.1.0-223, user gp was enabled by default, so, need to enable it if it is not disabled.
+    if [ -n "${CDC_VER_ORIG}" -a "${CDC_VER_ORIG}" -lt "410223" ]; then
+        cat /etc/centrifydc/centrifydc.conf | grep "^gp.disable.user" > /dev/null 2> /dev/null
+        if [ $? -ne 0 ]; then
+            echo "gp.disable.user: false" >> /etc/centrifydc/centrifydc.conf
+        fi
+    fi
+
+    # Run virtual registry migration tool
+    echo "Running virtual registry migration tool ..." >> ${LOG_FILE}
+    if [ -x /usr/share/centrifydc/mappers/extra/migreg.pl ]; then
+        /usr/share/centrifydc/mappers/extra/migreg.pl -d /var/centrifydc/reg >> ${LOG_FILE} 2>> ${LOG_FILE}
+    fi
+
+    echo executing fix_pam_rsh.sh ... >> ${LOG_FILE}
+    /usr/share/centrifydc/bin/fix_pam_rsh.sh >> ${LOG_FILE}
+
+    if [ -f /etc/centrifydc/openldap/ldap.conf.cdc_upgrade ]; then
+        echo restoring original ldap.conf ... >> ${LOG_FILE}
+        mv /etc/centrifydc/openldap/ldap.conf.cdc_upgrade /etc/centrifydc/openldap/ldap.conf >> ${LOG_FILE} 2>> ${LOG_FILE}
+    elif [ -f /usr/share/centrifydc/etc/openldap/ldap.conf.cdc_upgrade ]; then
+        echo restoring original ldap.conf ... >> ${LOG_FILE}
+        mv /usr/share/centrifydc/etc/openldap/ldap.conf.cdc_upgrade /etc/centrifydc/openldap/ldap.conf >> ${LOG_FILE} 2>> ${LOG_FILE}
+    fi
+    # replace dir with symlink for backward compatibility
+    if [ ! -h /usr/share/centrifydc/etc/openldap ]; then
+        rm -Rf /usr/share/centrifydc/etc/openldap >> ${LOG_FILE} 2>> ${LOG_FILE}
+        ln -s /etc/centrifydc/openldap /usr/share/centrifydc/etc/openldap
+    fi
+
+    # do cache upgrading
+    if [ -f /var/centrifydc/tmp/CENTRIFY_FORCE_CACHE_DELETE ]; then
+        echo "INFO: found /var/centrifydc/tmp/CENTRIFY_FORCE_CACHE_DELETE, removing cache ..." >> ${LOG_FILE}
+        ls -l /var/centrifydc/*.cache /var/centrifydc/*.idx  >> ${LOG_FILE} 2> /dev/null
+        rm -f /var/centrifydc/*.cache /var/centrifydc/*.idx  >> ${LOG_FILE} 2>> ${LOG_FILE}
+        rm -f /var/centrifydc/tmp/CENTRIFY_FORCE_CACHE_DELETE >> ${LOG_FILE} 2>> ${LOG_FILE}
+    elif [ ! -f /var/centrifydc/kset.domain ]; then
+        echo 'computer is not "joined", skip cache upgrading' >> ${LOG_FILE} 2>> ${LOG_FILE}
+    elif [ `/usr/bin/adinfo -c | grep 'adclient.cache.encrypt:' | grep true > /dev/null; echo $?` -eq 0 ]; then
+        echo "WARNING: cache is encrypted and it cannot be upgraded" | tee -a ${LOG_FILE}
+        ls -l /var/centrifydc/*.cache >> ${LOG_FILE} 2> /dev/null
+        if [ "$?" = "0" ]; then
+            echo removing *.cache files ... >> ${LOG_FILE}
+            rm -f /var/centrifydc/*.cache >> ${LOG_FILE} 2>> ${LOG_FILE}
+        fi
+        ls -l /var/centrifydc/*.idx >> ${LOG_FILE} 2> /dev/null
+        if [ "$?" = "0" ]; then
+            echo removing *.idx files ... >> ${LOG_FILE}
+            rm -f /var/centrifydc/*.idx >> ${LOG_FILE} 2>> ${LOG_FILE}
+        fi
+    elif [ -s /var/centrifydc/upgrade/CHECK_SUM_ORIG ]; then
+        CDC_CUR_CHECK_SUM="`cat /var/centrifydc/upgrade/CHECK_SUM_ORIG`"
+        echo upgrading cache from checksum ${CDC_CUR_CHECK_SUM} ... >> ${LOG_FILE} 2>> ${LOG_FILE}
+        RC=0
+        /usr/share/centrifydc/bin/adcache -F "${CDC_CUR_CHECK_SUM}" >> ${LOG_FILE} 2>> ${LOG_FILE} || RC=$?
+        if [ "$RC" != "0" ]; then
+            echo "cache upgrade exited with error, please check log file for details"
+        fi
+    elif [ -s /var/centrifydc/upgrade/CDC_VER_ORIG ]; then
+        CDC_CUR_VER_FULL="`cat /var/centrifydc/upgrade/CDC_VER_ORIG`"
+        if [ "`echo ${CDC_CUR_VER_FULL} | sed 's/[^0-9]*//g'`" -lt "510000" ]; then
+            echo "WARNING: cache cannot be upgraded from ${CDC_CUR_VER_FULL}" | tee -a ${LOG_FILE}
+            ls -l /var/centrifydc/*.cache >> ${LOG_FILE} 2> /dev/null
+            if [ "$?" = "0" ]; then
+                echo removing *.cache files ... >> ${LOG_FILE}
+                rm -f /var/centrifydc/*.cache >> ${LOG_FILE} 2>> ${LOG_FILE}
+            fi
+            ls -l /var/centrifydc/*.idx >> ${LOG_FILE} 2> /dev/null
+            if [ "$?" = "0" ]; then
+                echo removing *.idx files ... >> ${LOG_FILE}
+                rm -f /var/centrifydc/*.idx >> ${LOG_FILE} 2>> ${LOG_FILE}
+            fi
+        else
+            echo upgrading cache from version ${CDC_CUR_VER_FULL} ... >> ${LOG_FILE} 2>> ${LOG_FILE}
+            RC=0
+            /usr/share/centrifydc/bin/adcache -F "${CDC_CUR_VER_FULL}" >> ${LOG_FILE} 2>> ${LOG_FILE} || RC=$?
+            if [ "$RC" != "0" ]; then
+                echo "cache upgrade exited with error, please check log file for details"
+            fi
+        fi
+    fi
+
+    if [ -f /var/centrifydc/upgrade/START ]; then
+        if [ -f "/etc/nsswitch.conf.upgrade" ]; then
+            echo restoring /etc/nsswitch.conf ... >> ${LOG_FILE}
+            mv /etc/nsswitch.conf.upgrade /etc/nsswitch.conf >> ${LOG_FILE}
+        fi
+        echo starting adclient ... >> ${LOG_FILE}
+        /usr/share/centrifydc/bin/centrifydc start >> ${LOG_FILE} 2>> ${LOG_FILE}
+
+        # Update keytab if adclient is in connected status
+        echo "start to update keytab ..." >> ${LOG_FILE}
+        ADCLIENT_MODE=""
+        for i in 1 2 3 4
+        do
+            ADCLIENT_MODE="`/usr/bin/adinfo -m`"
+            if [ "X${ADCLIENT_MODE}" = "Xstarting" -o "X${ADCLIENT_MODE}" = "X<unavailable>" ]; then
+                echo "Adclient is ${ADCLIENT_MODE}. Wait for $i second(s)." >> ${LOG_FILE}
+                sleep $i
+            else
+                break
+            fi
+        done
+    
+        if [ "X${ADCLIENT_MODE}" = "Xconnected" ]; then
+            echo "updating keytab ..." >> ${LOG_FILE}
+            /usr/sbin/adkeytab -C -m >> ${LOG_FILE} 2>> ${LOG_FILE}
+        else
+            echo "skip to update keytab. Adclient is ${ADCLIENT_MODE}." >> ${LOG_FILE}
+        fi
+
+        rm /var/centrifydc/upgrade/START >> ${LOG_FILE}
+    fi
+    hash -r >> ${LOG_FILE}
+    # restore samba init script and configure for auto-startup
+    INIT_SCRIPT=/etc/init.d/centrifydc-samba
+    if [ -f ${INIT_SCRIPT}.upgrade ] && [ ! -f ${INIT_SCRIPT} ]; then
+        mv -f ${INIT_SCRIPT}.upgrade ${INIT_SCRIPT} >> ${LOG_FILE} 2>> ${LOG_FILE}
+        update-rc.d centrifydc-samba defaults 19 >> ${LOG_FILE} 2>> ${LOG_FILE}
+    fi
+    if [ -s /etc/syslog.conf ]; then
+        echo "Checking /etc/syslog.conf for user.debug entry" >> ${LOG_FILE}
+        cat /etc/syslog.conf | grep /var/log/centrifydc.log | grep '^user.debug' >> ${LOG_FILE} 2>> ${LOG_FILE}
+        if [ "$?" = "0" ]; then
+            echo turning debug off >> ${LOG_FILE}
+            /usr/share/centrifydc/bin/addebug off >> ${LOG_FILE} 2>> ${LOG_FILE}
+
+            echo "Checking /etc/syslog.conf for user.debug entry one more time" >> ${LOG_FILE}
+            cat /etc/syslog.conf | grep /var/log/centrifydc.log | grep '^user.debug' >> ${LOG_FILE} 2>> ${LOG_FILE}
+            if [ "$?" = "0" ]; then
+                echo Deleting user.debug entry from /etc/syslog.conf >> ${LOG_FILE}
+                cp -p /etc/syslog.conf /etc/syslog.conf.pre_cdc_upgrade >> ${LOG_FILE} 2>> ${LOG_FILE}
+                sed -e "/user.debug[ 	]*\/var\/log\/centrifydc.log/d" /etc/syslog.conf > /etc/syslog.conf.tmp_upgrade
+                mv -f /etc/syslog.conf.tmp_upgrade /etc/syslog.conf >> ${LOG_FILE} 2>> ${LOG_FILE}
+            fi
+
+            echo turning debug back on >> ${LOG_FILE}
+            /usr/share/centrifydc/bin/addebug on >> ${LOG_FILE} 2>> ${LOG_FILE}
+        fi
+    fi
+    # configure syslog-ng.conf when the syslog-ng has been installed
+    SYSLOGNG_CONF=""
+    if [ -s "/etc/syslog-ng/syslog-ng.conf" ]; then
+        SYSLOGNG_CONF="/etc/syslog-ng/syslog-ng.conf"
+    elif [ -f "/usr/local/etc/syslog-ng/syslog-ng.conf" ]; then
+        SYSLOGNG_CONF="/usr/local/etc/syslog-ng/syslog-ng.conf"
+    fi
+    if [ "X${SYSLOGNG_CONF}" != "X" ]; then
+        echo "Checking $SYSLOGNG_CONF for centrifydc.log" >> ${LOG_FILE}
+        cat $SYSLOGNG_CONF | grep /var/log/centrifydc.log  | grep "^destination centrify"  >> ${LOG_FILE} 2>> ${LOG_FILE}
+        if [ "$?" = "0" ]; then
+            echo turning debug off >> ${LOG_FILE}
+            /usr/share/centrifydc/bin/addebug off >> ${LOG_FILE} 2>> ${LOG_FILE}
+
+            echo "Checking $SYSLOGNG_CONF for centrifydc.log one more time" >> ${LOG_FILE}
+            cat $SYSLOGNG_CONF | grep /var/log/centrifydc.log  | grep "^destination centrify" >> ${LOG_FILE} 2>> ${LOG_FILE}
+            if [ "$?" = "0" ]; then
+                echo Deleting centrifydc.log from $SYSLOGNG_CONF >> ${LOG_FILE}
+                cp -p $SYSLOGNG_CONF ${SYSLOGNG_CONF}.pre_cdc_upgrade >> ${LOG_FILE} 2>> ${LOG_FILE}
+                sed -e "/\/var\/log\/centrifydc.log/d" -e "/f_centrify/d" $SYSLOGNG_CONF > ${SYSLOGNG_CONF}.tmp_upgrade
+                mv -f ${SYSLOGNG_CONF}.tmp_upgrade ${SYSLOGNG_CONF} >> ${LOG_FILE} 2>> ${LOG_FILE}
+            fi
+
+            echo turning debug back on >> ${LOG_FILE}
+            /usr/share/centrifydc/bin/addebug on >> ${LOG_FILE} 2>> ${LOG_FILE}
+        fi       
+    fi
+
+    # restart other Centrify daemons
+    echo "Checking adnisd ..." >> ${LOG_FILE}
+    PID="`ps -ae | awk '$4 ~ /^adnisd$/ { print $1; }'`" >> ${LOG_FILE}
+    if [ ! -z "$PID" ] &&  \
+       [ "`/usr/bin/adinfo -v | cut -d' ' -f3 | cut -d'-' -f1`" = "`/usr/sbin/adnisd -v | cut -d' ' -f2 | cut -d'-' -f1`" ]; then
+        echo "Restarting adnisd ..."  >> ${LOG_FILE}
+        ps -ae | awk '$4 ~ /^adnisd$/' >> ${LOG_FILE}
+        /etc/init.d/adnisd restart  >> ${LOG_FILE}
+        ps -ae | awk '$4 ~ /^adnisd$/' >> ${LOG_FILE}
+    fi
+
+    echo "Checking dad ..." >> ${LOG_FILE}
+    PID="`ps -ae | awk '$4 ~ /^dad$/ { print $1; }'`" >> ${LOG_FILE}
+    if [ ! -z "$PID" ]; then
+        echo "Restarting dad ..."  >> ${LOG_FILE}
+        ps -ae | awk '$4 ~ /^dad$/' >> ${LOG_FILE}
+        for tries in 1 2 3 4 5; do
+            dadPid=`ps -ae | awk '$4 ~ /^dad$/ { print $1; }'`
+            if [ ! -z "$dadPid" ]; then
+                case "$tries" in
+                1)
+                    echo stopping dad by centrifyda stop ... >> ${LOG_FILE}
+                    /etc/init.d/centrifyda stop >> ${LOG_FILE} 2>> ${LOG_FILE}
+                    ;;
+                2)
+                    echo stopping dad by dastop ... >> ${LOG_FILE}
+                    /usr/sbin/dastop >> ${LOG_FILE} 2>> ${LOG_FILE}
+                    ;;
+                3 | 4)
+                    echo stopping dad by kill ... >> ${LOG_FILE}
+                    kill $dadPid >> ${LOG_FILE} 2>> ${LOG_FILE}
+                    ;;
+                5)
+                    echo stopping dad by kill ... >> ${LOG_FILE}
+                    kill -9 $dadPid >> ${LOG_FILE} 2>> ${LOG_FILE}
+                    ;;
+                esac
+                sleep 5
+            else
+                echo DirectAudit daemon status: not running ... >> ${LOG_FILE}
+                break
+            fi
+        done
+        /etc/init.d/centrifyda start  >> ${LOG_FILE}
+        ps -ae | awk '$4 ~ /^dad$/' >> ${LOG_FILE}
+    fi
+
+    if [ -x /usr/sbin/dacontrol ] && [ -x /usr/bin/dainfo ]; then
+        /usr/bin/dainfo > /dev/null 2>&1
+        if [ $? = 0 ]; then
+            CDA_CUR_VER="`/usr/bin/dainfo -v  | cut -d' ' -f3 | cut -d- -f1`"
+            echo CDA_CUR_VER=${CDA_CUR_VER} >> ${LOG_FILE}
+
+            if [ `echo ${CDA_CUR_VER} | cut -d'.' -f1` -ge 3 ]; then
+                /usr/sbin/dacontrol --cdashHangWithoutDad >> ${LOG_FILE} 2>> ${LOG_FILE}
+            fi
+        fi
+    fi
+
+    echo Centrify DirectControl has been successfully upgraded. >> ${LOG_FILE}
+fi
+
+exit 0

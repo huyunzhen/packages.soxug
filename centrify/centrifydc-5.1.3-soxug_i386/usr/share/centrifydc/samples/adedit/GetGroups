@@ -1,0 +1,21 @@
+#!/usr/bin/env adedit
+
+# GetGroups
+# Purpose: Retrieves the UNIX group attribute values for each UNIX
+# group administered in the parent zone specified in setenv.
+# To select a different zone, change the DN in the select_zone command
+
+package require ade_lib 
+
+puts "
+This script retrieves the group attribute values for each UNIX group in the specified parent zone"
+
+source setenv
+
+select_zone "CN=$parentZone,CN=$zonesContainer,OU=$zonesContainerOU,$domaindn"
+
+foreach GROUP [get_zone_groups] {
+	select_zone_group $GROUP
+	puts  -nonewline "[gzgf name]:[gzgf gid]"; puts :$GROUP
+  }
+ 

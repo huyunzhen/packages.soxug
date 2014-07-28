@@ -1,0 +1,1294 @@
+#!/bin/bash
+#
+##############################################################################
+#
+# addebug - Turn debug logging on/off.
+#
+# usage: addebug {on|off|clear|syslog|status|set [module.name] [level]}
+#
+# addebug on:
+#   /etc/centrifydc/centrifydc.conf will be configured to log DEBUG messages,
+#   and syslog daemon (syslog|syslogd|syslog-ng) will be configured to route
+#   debug info into centrifydc.log. Creates centrify_client.log for client
+#   logging when adclient daemon is not running.
+#
+# addebug off:
+#   /etc/centrifydc/centrifydc.conf will be configured to log INFO messages,
+#   and syslog daemon (syslog|syslogd|syslog-ng) will be configured to route
+#   nothing to centrifydc.log. Removes centrify_client.log
+#
+# addebug clear:
+#  Clears contents of centrifydc.log and centrify_client.log
+#
+# addebug syslog:
+#  Tell syslog to reload it's config file.   Used by adsec in DirectSecure
+#
+# addebug set [module.name] [level]:
+#   If module.name is not specified, "log" is used.
+#       i.e.: addebug set TRACE
+#   Results in: 
+#       log: TRACE
+#  
+#   Where if module.name is specified, it's inserted after the "log" string,
+#       i.e.: addebug set audit DEBUG
+#   Results in: 
+#       log.audit: DEBUG
+#
+# addebug status:
+#   print current log level of all modules, could be TRACE,DEBUG, INFO, WARNING, ERROR, FATAL or DISABLED
+#
+# /etc/centrifydc/centrifydc.conf will be reloaded by adreload if it's changed.
+#
+# Exit value:
+#   0   Normal
+#   1   Error
+#   2   Usage
+#
+##############################################################################
+
+NAME="Centrify DirectControl"
+LOGLEVELLIST="TRACE DEBUG DIAG INFO WARNING ERROR FATAL DISABLED" 
+SYSLOG_DAEMON=""
+SYSLOG_CONF="/etc/syslog.conf"
+SYSLOG_CONF_BAK=${SYSLOG_CONF}."pre_cdc"
+SYSLOG_CONF_TMP="/tmp/syslog.$$"
+
+SYSTEMD_JOURNAL_CONF="/etc/systemd/journald.conf"
+SYSTEMD_JOURNAL_CONF_BAK=${SYSTEMD_JOURNAL_CONF}."pre_cdc"
+
+CDC_LOG_DIRECTORY="/var/log"
+CDC_LOG=""
+CDC_CLIENT_LOG=""
+CDC_RELOAD="/usr/sbin/adreload"
+CDC_CONF="/etc/centrifydc/centrifydc.conf"
+CDC_CONF_TMP="/tmp/centrifydc.$$"
+PREV_LOG_SETTING_OFF="/etc/centrifydc/prev_log_setting_off"
+
+SYSLOG_FACILITY="auth"
+SYSLOG_CDC_ENTRY_ADD=""         # Text that will be append to syslog config
+SYSLOG_CDC_ENTRY_REMOVE=""      # sed pattern for removing CentrifyDC config
+                                #   from syslog config
+
+SYSLOG_CDC_ENTRY_EXTRA_SIGNATURE="# line inserted by Centrify DirectControl"
+SYSLOG_CDC_ENTRY_EXTRA_ADD=""
+SYSLOG_CDC_ENTRY_EXTRA_REMOVE=""
+
+TARGET_OS=""
+
+ID="/usr/bin/id"
+ECHO="echo"
+SED="sed"
+TRUE=1
+FALSE=0
+
+TYPE_UNKNWON=0
+TYPE_SYSLOG_NG=1
+TYPE_RSYSLOG=2
+TYPE_SYSLOG=3
+
+USE_SYSTEMD_JOURNAL=0
+
+program_name=`basename $0`
+
+
+
+# >>> Function definition start >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+
+error()
+{
+    $ECHO "ERROR: $*"
+    exit 1
+}
+
+warning()
+{
+    $ECHO "WARNING: $*"
+}
+
+usage()
+{
+    if [ $USE_SYSTEMD_JOURNAL -eq 0 ]; then
+        $ECHO "Usage: $program_name {on|off|clear|syslog|set|status|help}"
+    else
+        $ECHO "Usage: $program_name {on|off|journal|set|status|help}"
+    fi
+    exit 2
+}
+
+restore_context()
+{
+    # Restore context type if has selinux
+    if [ -x "`which restorecon 2>&1`" ]; then
+        restorecon $*
+    elif [ -x /sbin/restorecon ]; then
+        /sbin/restorecon $*
+    elif [ -x /usr/sbin/restorecon ]; then
+        /usr/sbin/restorecon $*
+    fi
+}
+
+#
+# Get uid
+#
+get_uid()
+{
+    if [ -z "$UID" ]; then
+        UID=`${ID} | ${SED} -e 's/uid=//' -e 's/(.*$//'`
+        export UID
+    fi
+}
+
+
+#
+# Get the pid from the pid file, and verify it with ps.
+# This only works on systems with a ps that supports the
+# POSIX -o option.
+#
+pidfile_status() {
+    if [ -f /var/run/adclient.pid ]
+    then
+        local_pid=`${CAT} /var/run/adclient.pid`
+        local_command=`${PS} -o command= -p $pid 2> /dev/null`
+        case "$local_command" in
+            *adclient)
+                echo "${NAME} (pid $local_pid) is running..."
+                ;;
+
+            *)
+                echo "${NAME} is stopped"
+                ;;
+        esac
+    fi
+}
+
+#
+# Check which syslog daemon is running on the platforms
+#
+# @return   TYPE_SYSLOG_NG: syslog-ng
+#           TYPE_RSYSLOG: rsyslog
+#           TYPE_SYSLOG: syslog
+#           TYPE_UNKNWON: no syslog daemon running
+#
+check_syslog_daemon()
+{
+    # if syslog-ng is running, modify syslog-ng config
+    syslogng_pid=""
+    if [ -f "/var/run/syslog-ng.pid" ]; then    # This will not work on AIX
+        syslogng_pid=`cat /var/run/syslog-ng.pid`
+    elif [ -f "/etc/syslog-ng/syslog-ng.pid" ]; then  #In Solaris, the file "syslog-ng.pid" is in /etc/syslog-ng/.
+        syslogng_pid=`cat /etc/syslog-ng/syslog-ng.pid`
+    elif [ -f "/etc/syslog-ng.pid" ]; then            #In AIX, the pid file is in /etc.
+        syslogng_pid=`cat /etc/syslog-ng.pid` 
+    fi
+    if [ $? -eq 0 ] && [ -n "$syslogng_pid" ]; then
+        ps -p $syslogng_pid >/dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            return $TYPE_SYSLOG_NG;
+        fi
+    fi
+
+    # if rsyslogd is running, modify rsyslogd config
+    rsyslog_pid=""
+    if [ -f "/var/run/rsyslogd.pid" ]; then
+        rsyslog_pid=`cat /var/run/rsyslogd.pid`
+    elif [ -f "/etc/rsyslog.pid" ]; then
+        rsyslog_pid=`cat /etc/rsyslog.pid`
+    fi
+    if [ $? -eq 0 ] && [ -n "$rsyslog_pid" ]; then
+        ps -p $rsyslog_pid >/dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            return $TYPE_RSYSLOG;
+        fi
+    fi
+
+    syslog_pid=""
+    if [ -f "/var/run/syslogd.pid" ]; then
+        syslog_pid=`cat /var/run/syslogd.pid`
+    elif [ -f "/etc/syslog.pid" ]; then
+        syslog_pid=`cat /etc/syslog.pid`
+    fi
+    if [ $? -eq 0 ] && [ -n "$syslog_pid" ]; then
+        process=`ps -p $syslog_pid |grep rsyslogd`
+        # In redhat 6, the pid file of rsyslogd is syslogd.pid
+        if [ $? -eq 0 ] && [ -n "$process" ]; then
+            return $TYPE_RSYSLOG;
+        fi
+        ps -p $syslog_pid >/dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            return $TYPE_SYSLOG;
+        fi
+    fi
+
+    # Other, return 0
+    return $TYPE_UNKNWON;
+}
+
+#
+# Identify operating system. Sets TARGET_OS to a canonical value.
+#
+identify_operating_system ()
+{
+    UNAME=`uname -a`
+
+    case "$UNAME" in
+        AIX*)
+            TARGET_OS="aix"
+            STATUS_CMD="/usr/bin/lssrc -s centrifydc"
+            ECHO="echo"
+            GREP="/usr/bin/grep"
+            SED="/usr/bin/sed"
+            SYSLOG_DAEMON="syslogd"
+            # Enable log rotation
+            CDC_LOG_OPTIONS="\trotate size 5m files 5 compress"
+            ;;
+        HP-UX*)
+            TARGET_OS="hpux"
+            STATUS_CMD="/sbin/init.d/centrifydc status"
+            if [ -n "`echo -e "\n"`" ]; then            
+                ECHO="echo"
+            else
+                ECHO="echo -e"
+            fi
+            GREP="/usr/bin/grep"
+            SED="/usr/bin/sed"
+            CDC_LOG_DIRECTORY="/var/adm/syslog"            
+            SYSLOG_DAEMON="syslog"
+            ;;
+        SunOS*)
+            TARGET_OS="solaris"
+            STATUS_CMD="/etc/init.d/centrifydc status"
+            if [ -n "`echo -e "\n"`" ]; then            
+                ECHO="echo"
+            else
+                ECHO="echo -e"
+            fi
+            GREP="/usr/bin/grep"
+            SED="/usr/bin/sed"
+            SYSLOG_DAEMON="syslog"
+            ;;
+        Linux*)
+            TARGET_OS="linux"
+            STATUS_CMD="/etc/init.d/centrifydc status"
+            # On RHEL, /bin/bash is linked to bash. So we need to add "-e" to
+            # enable interpretation of backslash escapes.
+            # However, on Ubuntu, /bin/bash is sh. So we can't add "-e" parameter.
+            if [ -n "`echo -e "\n"`" ]; then            
+                ECHO="echo"
+            else
+                ECHO="echo -e"
+            fi
+            GREP="/bin/grep"
+            SED="/bin/sed"
+            # Only linux supports the "-" to specify async logging
+            ASYNC_LOG="-"
+            SYSLOG_DAEMON="syslogd"
+            if [ -f /etc/fedora-release ]; then
+                OS_REV="fedora"
+            elif [ -f /etc/redhat-release ]; then
+                OS_REV="redhat"
+            elif [ -f /etc/SuSE-release -o -f /etc/UnitedLinux-release ]; then
+                OS_REV="suse"
+            elif [ -f /etc/debian_version ]; then
+                OS_REV="debian"
+            else
+                OS_REV="unknown"
+            fi
+            ;;
+        Darwin*)
+            TARGET_OS="darwin"
+            STATUS_CMD="pidfile_status"
+            OS_VERSION=`/usr/bin/sw_vers -productVersion`
+            case "$OS_VERSION" in 
+                10.4*)
+                    ECHO="echo -e"
+                    ;;
+                *)
+                    ECHO="echo"
+                    ;;
+            esac
+            GREP="/usr/bin/grep"
+            SED="/usr/bin/sed"
+            SYSLOG_DAEMON="syslogd"
+            ;;
+        IRIX*)
+            TARGET_OS="irix"
+            STATUS_CMD="/etc/init.d/centrifydc status"
+            ECHO="echo"
+            GREP="/sbin/grep"
+            SED="/bin/sed"
+            SYSLOG_DAEMON="syslogd"
+            ;;
+        *)  echo "Unrecognized System=$UNAME"
+            echo "Cannot continue."
+            exit 1;;
+    esac
+    
+    CDC_LOG="${CDC_LOG_DIRECTORY}/centrifydc.log"
+    CDC_CLIENT_LOG="${CDC_LOG_DIRECTORY}/centrify_client.log"
+}
+
+#
+# Update variables based on syslog daemon
+#
+update_variables()
+{
+    # Read the syslog facility from syslog.conf.
+    facility=`sed -n -e 's/^logger.facility[:   ][  ]*\(.*\)/\1/p' $CDC_CONF`
+    if [ "$facility" != "" ]
+    then
+        SYSLOG_FACILITY="$facility"
+    fi
+
+    check_syslog_daemon
+    syslog_type=$?
+
+    # Check /etc/sysconfig/syslog file if exists
+    if [ $syslog_type -eq $TYPE_UNKNWON ] \
+        && [ -f "/etc/sysconfig/syslog" ]; then
+        sysconfig_syslog=`sed -n -e 's/^SYSLOG_DAEMON="\(.*\)"/\1/p' /etc/sysconfig/syslog`
+        if [ "$sysconfig_syslog" = "syslog-ng" ] ; then
+            syslog_type=$TYPE_SYSLOG_NG
+        elif [ "$sysconfig_syslog" = "rsyslogd" ] ; then
+            syslog_type=$TYPE_RSYSLOG
+        elif [ "$sysconfig_syslog" = "syslogd" ] ; then
+            syslog_type=$TYPE_SYSLOG
+        fi
+    fi
+
+    # Check conf file
+    if [ $syslog_type -eq $TYPE_UNKNWON ] ; then
+        if [ -f "/etc/syslog-ng/syslog-ng.conf" ] \
+            || [ -f "/usr/local/etc/syslog-ng/syslog-ng.conf" ] \
+            || [ -f "/etc/syslog-ng.conf" ] ; then 
+            syslog_type=$TYPE_SYSLOG_NG
+        elif [ -f "/etc/rsyslog.conf" ] ; then
+            syslog_type=$TYPE_RSYSLOG
+        else
+            syslog_type=$TYPE_SYSLOG
+        fi
+    fi
+
+    # Update variables
+    if [ $syslog_type -eq $TYPE_SYSLOG_NG ] ; then # syslog-ng
+        SYSLOG_DAEMON="syslog-ng"
+
+        if [ -f "/etc/syslog-ng/syslog-ng.conf" ] ; then
+            SYSLOG_CONF="/etc/syslog-ng/syslog-ng.conf"
+        elif [ -f "/usr/local/etc/syslog-ng/syslog-ng.conf" ] ; then
+            SYSLOG_CONF="/usr/local/etc/syslog-ng/syslog-ng.conf"
+        elif [ -f "/etc/syslog-ng.conf" ] ; then 
+            SYSLOG_CONF="/etc/syslog-ng.conf"       
+        else
+            error "Can not find syslog-ng.conf in /etc/:/etc/syslog-ng/:/usr/local/etc/syslog-ng/."
+        fi
+        FLGS="flags(final);"
+        SRC=src
+        case $TARGET_OS in
+            linux)
+                case "$OS_REV" in
+                    redhat)
+                       SRC=s_sys
+                       ;;
+                    suse)
+                       SRC=src
+                       FLGS=""
+                       ;;
+                    debian)
+                       SRC=s_all
+                       ;;
+                esac
+                ;;
+            *)
+                SRC=src
+                ;;
+        esac
+        SYSLOG_CONF_BAK=${SYSLOG_CONF}."pre_cdc"
+        SYSLOG_CDC_ENTRY_ADD="# Centrify DirectControl logging\nfilter f_centrify { facility($SYSLOG_FACILITY) or facility(auth) or facility(authpriv); };\ndestination centrify { file(\"$CDC_LOG\"); };\nlog { source($SRC); filter(f_centrify); destination(centrify); $FLGS };"
+        SYSLOG_CDC_ENTRY_REMOVE="/^# Centrify DirectControl logging/,/^log {source($SRC); filter(f_centrify)/d"
+    elif [ $syslog_type -eq $TYPE_RSYSLOG ] ; then # rsyslogd
+        SYSLOG_DAEMON="rsyslogd"
+        SYSLOG_CONF="/etc/rsyslog.conf"
+        SYSLOG_CONF_BAK=${SYSLOG_CONF}."pre_cdc"
+        SYSLOG_CDC_ENTRY_ADD="# Centrify DirectControl logging\n${SYSLOG_FACILITY}.debug\t\t\t\t${ASYNC_LOG}${CDC_LOG}${CDC_LOG_OPTIONS}"
+        SYSLOG_CDC_ENTRY_REMOVE="/^# Centrify DirectControl logging/,/^$SYSLOG_FACILITY.debug/d"
+
+        # Disable rate limiting on rsyslogd when addebug is on
+        rsyslog_supported_rate_limiting
+        if [ $? -eq 0 ] ; then
+            SYSLOG_CDC_ENTRY_EXTRA_ADD="\$SystemLogRateLimitInterval 1\t\t${SYSLOG_CDC_ENTRY_EXTRA_SIGNATURE}\n\$SystemLogRateLimitBurst 1000\t\t${SYSLOG_CDC_ENTRY_EXTRA_SIGNATURE}"
+            SYSLOG_CDC_ENTRY_EXTRA_REMOVE="/${SYSLOG_CDC_ENTRY_EXTRA_SIGNATURE}$/d"
+        fi
+    else # other
+        SYSLOG_CDC_ENTRY_ADD="# Centrify DirectControl logging\n${SYSLOG_FACILITY}.debug\t\t\t\t${ASYNC_LOG}${CDC_LOG}${CDC_LOG_OPTIONS}"
+        SYSLOG_CDC_ENTRY_REMOVE="/^# Centrify DirectControl logging/,/^$SYSLOG_FACILITY.debug/d"
+    fi
+}
+
+#
+# Check required files and create/modify them if necessary.
+#
+check_files()
+{
+    if [ $USE_SYSTEMD_JOURNAL -eq 0 ]; then
+        if [ ! -f "$SYSLOG_CONF" ] ; then
+            error "$SYSLOG_CONF not found. Operation cancelled."
+        fi
+    else
+        if [ ! -f "$SYSTEMD_JOURNAL_CONF" ] ; then
+            error "$SYSTEMD_JOURNAL_CONF not found. Operation cancelled."
+        fi
+    fi
+
+    if [ ! -f "$CDC_CONF" ] ; then
+        error "$CDC_CONF not found. Operation cancelled."
+    fi
+
+
+    if [ ! -f "$CDC_RELOAD" ] ; then
+        error "$CDC_RELOAD not found. Operation cancelled."
+    fi
+
+    #Creating log file folder if it does not exist.
+    [ ! -d ${CDC_LOG_DIRECTORY} ] && mkdir -p ${CDC_LOG_DIRECTORY}
+
+    if [ ! -f $CDC_CLIENT_LOG ] ; then
+        $ECHO "$CDC_CLIENT_LOG does not exist. Creating now."
+        touch $CDC_CLIENT_LOG
+        restore_context $CDC_CLIENT_LOG
+    fi
+    
+    # Make sure client log world write-only: clients can append (and overwrite), but not view other user's troubles.
+    chmod o-r,go+w $CDC_CLIENT_LOG
+
+    # Make sure the log line is in there somewhere in centrifydc.conf file
+    grep '^log *[:=]' $CDC_CONF > /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        warning "log line not found in ${CDC_CONF}. Now add."
+        $ECHO "\nlog: INFO" >> $CDC_CONF
+    fi
+}
+
+get_log_level()
+{
+    local_logvalue=`grep '^log *[:=]' $CDC_CONF | \
+               $SED -n -e '$ s/^log *[:=] *\([a-zA-Z]*\) *$/\1/p'`
+    if [ -z "$local_logvalue" ]; then
+        local_logvalue="INFO"
+    fi    
+    $ECHO "$local_logvalue"
+}
+
+#
+# Convert the log level in $1 to on or off.
+# 
+log_level_to_status()
+{
+    case $1 in
+        TRACE|DEBUG|DIAG)
+            $ECHO on;;
+        INFO|WARNING|ERROR|FATAL|DISABLED)
+            $ECHO off;;
+        *)
+            $ECHO '';;
+    esac
+}
+
+#
+# Figure out the current status. return on or off.
+# In case of multiple definitions, use the last one.
+#
+get_log_status()
+{
+    local_logvalue=`get_log_level`
+    log_level_to_status $local_logvalue
+}
+
+#
+# Send SIGHUP to syslog daemon
+#
+notify_syslog_daemon()
+{
+    $ECHO "Send HUP signal to ${SYSLOG_DAEMON}"
+
+    case "$TARGET_OS" in
+        linux*|irix*|darwin*)
+            
+            # Start from ubuntu 13.10, if the system is inited via upstart,
+            # "/etc/init.d/rsyslog restart" will return 1 immediately. 
+            # So rsyslog won't be restart by this way. 
+            # We need to restart rsyslog via the upstart methord
+            if [ "${SYSLOG_DAEMON}" = "rsyslogd" -a -f "/etc/init/rsyslog.conf" ] && \
+                /sbin/initctl version > /dev/null 2>&1; then
+                /sbin/initctl restart rsyslog > /dev/null 2>&1 
+            elif [ "${SYSLOG_DAEMON}" = "rsyslogd" -a -x /etc/init.d/rsyslog ]; then 
+                /etc/init.d/rsyslog restart > /dev/null 2>&1 
+            elif [ "${SYSLOG_DAEMON}" = "rsyslogd" -a -x /bin/systemctl -a -f /lib/systemd/system/rsyslog.service ]; then
+                /bin/systemctl restart rsyslog.service > /dev/null 2>&1
+            elif [ "${SYSLOG_DAEMON}" = "rsyslogd" -a -x "/sbin/${SYSLOG_DAEMON}" ]; then
+                killall ${SYSLOG_DAEMON}
+                /sbin/${SYSLOG_DAEMON} -f ${SYSLOG_CONF}
+            elif [ "${SYSLOG_DAEMON}" = "rsyslogd" -a -x "/usr/sbin/${SYSLOG_DAEMON}" ]; then
+                killall ${SYSLOG_DAEMON}
+                /usr/sbin/${SYSLOG_DAEMON} -f ${SYSLOG_CONF}
+            elif [ "${SYSLOG_DAEMON}" = "rsyslogd" -a -x "`which ${SYSLOG_DAEMON} 2>&1`" ]; then
+                killall ${SYSLOG_DAEMON}
+                `which ${SYSLOG_DAEMON}` -f ${SYSLOG_CONF}
+            else
+                killall -HUP ${SYSLOG_DAEMON}
+            fi
+            ;;
+        aix*)
+            refresh -s ${SYSLOG_DAEMON}
+            ;;
+        *)
+            if [ -f "/var/run/${SYSLOG_DAEMON}.pid" ]; then
+                syslog_pid=`cat /var/run/${SYSLOG_DAEMON}.pid`
+            else
+                if [ -f "/etc/${SYSLOG_DAEMON}.pid" ]; then
+                    syslog_pid=`cat /etc/${SYSLOG_DAEMON}.pid`
+                elif [ -f "/etc/syslog-ng/${SYSLOG_DAEMON}.pid" ]; then
+                    syslog_pid=`cat /etc/syslog-ng/${SYSLOG_DAEMON}.pid`
+                else
+                    $ECHO "${SYSLOG_DAEMON} is not running"
+                    return
+                fi
+            fi
+            ps -p $syslog_pid >/dev/null 2>&1
+            if [ $? -ne 0 ] ; then
+                $ECHO "${SYSLOG_DAEMON} is not running"
+                return
+            fi
+            kill -HUP $syslog_pid
+            ;;
+    esac
+}
+
+#
+# Restart systemd journal daemon
+#
+notify_systemd_journal_daemon()
+{
+    $ECHO "Restart systemd journal daemon"
+
+    /bin/systemctl restart systemd-journald.service
+}
+
+# Check module name whether it exists.
+check_module_name()
+{
+    grep "^$1 *[:=]" $CDC_CONF >/dev/null 2>&1 
+    if [ $? -ne 0 ] ; then
+        # Make sure the module line is in there somewhere in centrifydc.conf file
+        $ECHO "$1 line not found in ${CDC_CONF}, adding now."
+        $ECHO "" >> $CDC_CONF
+        $ECHO "# $1 by addebug added" >> $CDC_CONF
+        $ECHO "$1: $2" >> $CDC_CONF
+    fi
+}
+
+# Check module name's value whether it's right.
+check_module_value()
+{
+    local_isfindlevel=$FALSE
+    for local_modulevalue in $LOGLEVELLIST ; do
+        if [ "$local_modulevalue" = "$1" ]; then
+            local_isfindlevel=$TRUE
+            break
+        fi
+    done
+    if [ "$local_isfindlevel" = "$FALSE" ] ; then
+        error "$1 is invalid! Available log level($LOGLEVELLIST)."
+    fi
+}
+
+
+#
+# Check privilege of current user.
+#
+# @param 1  action (on|off|clear)
+#
+check_privilege()
+{
+    case "$1" in
+        on|off)
+            if [ $UID -ne 0 ]; then
+                error "Root privilege is required to modify addebug settings."
+            fi
+            ;;
+        clear)
+            if [ $UID -ne 0 ]; then
+                error "Root privilege is required to clear log file."
+            fi
+            ;;
+    esac
+}
+
+#
+# Configure syslog to log all messages without limits.
+#
+# @param 1  action (on|off)
+# @return   0 for successful
+#
+update_syslog_limit()
+{
+    local_action="$1"
+
+    if [ "$TARGET_OS" != "darwin" ]; then
+        return 0
+    fi
+
+    case "$OS_VERSION" in
+        10.4*|10.5*)
+            return 0
+            ;;
+    esac
+
+    local_syslogd_domain="/System/Library/LaunchDaemons/com.apple.syslogd"
+    local_syslogd_plist="${local_syslogd_domain}.plist"
+    local_syslogd_plist_bak="${local_syslogd_plist}.pre_cdc"
+
+    local_syslog_args=`defaults read ${local_syslogd_domain} ProgramArguments \
+        | awk '
+            BEGIN {
+                tmp = "";
+            }
+            /[^()]/ {
+                gsub(/"/, "");
+                gsub(/,/, "");
+                tmp = tmp " " $0;
+            }
+            END {
+                print tmp;
+            }'`
+
+    local_update_launchd="no"
+
+    case "$local_action" in
+        on)
+            $ECHO $local_syslog_args | grep -- '-mps_limit[[:space:]]0' > /dev/null 2>&1
+            if [ "$?" -ne 0 ]; then
+                if [ ! -f "$local_syslogd_plist_bak" ]; then
+                    cp ${local_syslogd_plist} ${local_syslogd_plist_bak}
+                    if [ "$?" -ne 0 ]; then
+                        warning "Can't backup $local_syslogd_plist"
+                        return 1
+                    fi
+                fi
+
+                local_syslog_args=`$ECHO $local_syslog_args | sed -E 's/-mps_limit +[0-9]+//g'`
+                local_syslog_args="$local_syslog_args -mps_limit 0"
+                defaults write $local_syslogd_domain ProgramArguments \
+                    -array $local_syslog_args
+                plutil -convert xml1 $local_syslogd_plist
+                chmod 644 $local_syslogd_plist
+                local_update_launchd="yes"
+            fi
+            ;;
+        off)
+            if [ -f "$local_syslogd_plist_bak" ]; then
+                mv -f ${local_syslogd_plist_bak} ${local_syslogd_plist}
+                local_update_launchd="yes"
+            fi
+            ;;
+    esac
+
+    if [ "$local_update_launchd" = "yes" ]; then
+        launchctl unload $local_syslogd_plist
+        launchctl load $local_syslogd_plist
+        sleep 1
+    fi
+
+    return 0
+}
+
+#
+# Configure syslog (or syslog-ng) configuration file.
+# If debug logging is turned on, route messages to centrifydc.log.
+#
+# @param 1  action (on|off)
+# @return   0 for successful
+#
+update_syslog_config_file()
+{
+    is_cdc_entry_found=0
+
+    if [ -z "$1" ] ; then
+        return 1
+    fi
+
+    current_status=`get_log_status`
+    if [ "$current_status" = "$1" ] ; then
+        return 0
+    fi
+
+    # Create a temp syslog config file from which our lines are removed
+    $SED -e "$SYSLOG_CDC_ENTRY_REMOVE" $SYSLOG_CONF > $SYSLOG_CONF_TMP
+
+    diff $SYSLOG_CONF $SYSLOG_CONF_TMP > /dev/null 2>&1
+    is_cdc_entry_found=$?
+
+    # Backup syslog config file
+    if [ ! -f "$SYSLOG_CONF_BAK" ]; then
+        cp -p $SYSLOG_CONF $SYSLOG_CONF_BAK
+    fi
+
+    case "$1" in
+        on)
+            $ECHO "Configure ${SYSLOG_CONF}"
+            if [ $is_cdc_entry_found -eq 0 ] ; then    # Not found
+                $ECHO "$SYSLOG_CDC_ENTRY_ADD" >> $SYSLOG_CONF
+
+                if [ "$SYSLOG_CDC_ENTRY_EXTRA_ADD" != "" ] ; then
+                    $ECHO "$SYSLOG_CDC_ENTRY_EXTRA_ADD" >> $SYSLOG_CONF
+                fi
+
+                rm -f $SYSLOG_CONF_TMP
+            else
+                # Old CentrifyDC settings may exist in syslog configuration.
+                #   To handle this situation, remove old settings and append
+                #   new settings to syslog config file.
+                $ECHO "$SYSLOG_CDC_ENTRY_ADD" >> $SYSLOG_CONF_TMP
+
+                if [ "$SYSLOG_CDC_ENTRY_EXTRA_ADD" != "" ] ; then
+                    $ECHO "$SYSLOG_CDC_ENTRY_EXTRA_ADD" >> $SYSLOG_CONF_TMP
+                fi
+
+                mv -f $SYSLOG_CONF_TMP $SYSLOG_CONF
+            fi
+            ;;
+        off)
+            if [ $is_cdc_entry_found -eq 0 ] ; then    # Not found
+                rm -f $SYSLOG_CONF_TMP                 # Nothing changed
+                return 0
+            else
+                $ECHO "Configure ${SYSLOG_CONF}"
+
+                # Remove extra lines inserted by us when addebug is off
+                # e.g. rsyslogd's rate limiting settings
+                if [ "$SYSLOG_CDC_ENTRY_EXTRA_REMOVE" != "" ] ; then
+                    $SED -e "$SYSLOG_CDC_ENTRY_EXTRA_REMOVE" $SYSLOG_CONF_TMP > $SYSLOG_CONF
+                    rm -f $SYSLOG_CONF_TMP
+                else
+                    mv -f $SYSLOG_CONF_TMP $SYSLOG_CONF
+                fi
+
+                # Check if there is any other 'centrifydc.log' setting in
+                #   syslog configuration. These custom settings will not
+                #   be removed.
+                grep $CDC_LOG $SYSLOG_CONF > /dev/null 2>&1
+                if [ $? -eq 0 ]; then
+                    $ECHO "Custom setting of ${CDC_LOG} found in ${SYSLOG_CONF}."
+                fi
+            fi
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    restore_context ${SYSLOG_CONF}
+
+    notify_syslog_daemon
+}
+
+#
+# Configure systemd journal configuration file.
+# If debug logging is turned on, MaxLevelStore's value should be "debug"
+#
+# @param 1  action (on|off)
+# @return   0 for successful
+#
+update_systemd_journal_config_file()
+{
+    if [ -z "$1" ] ; then
+        return 1
+    fi
+
+    current_status=`get_log_status`
+    if [ "$current_status" = "$1" ] ; then
+        return 0
+    fi
+
+    case "$1" in
+        on)
+            $ECHO "Configure ${SYSTEMD_JOURNAL_CONF}"
+            cp -p $SYSTEMD_JOURNAL_CONF $SYSTEMD_JOURNAL_CONF_BAK
+            $SED -e 's/.*MaxLevelStore.*/MaxLevelStore=debug/' -i $SYSTEMD_JOURNAL_CONF
+            ;;
+        off)
+            $ECHO "Configure ${SYSTEMD_JOURNAL_CONF}"
+            mv $SYSTEMD_JOURNAL_CONF_BAK $SYSTEMD_JOURNAL_CONF
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    restore_context ${SYSTEMD_JOURNAL_CONF}
+
+    notify_systemd_journal_daemon
+}
+
+#
+# Configure CentrifyDC configuration file, then reload the file using adreload.
+# If debug logging is turned on, then change all "log: INFO" to "log: DEBUG"
+# If debug logging is turned off, then change all "log: DEBUG" to "log: INFO"
+#
+# @param 1  action (log module name)
+# @param 2  value of param 1
+# @return   0 for successful
+#
+update_cdc_config_file()
+{    
+    if [ -z "$1" -o -z "$2" ] ; then
+        return 1
+    fi
+   
+    if [ "$TARGET_OS" = "darwin" -a "$1" = "log" ]; then
+        case "$2" in
+            TRACE|DEBUG)
+                $SED -e 's,^logger\.destination.*,logger\.destination: /var/log/centrifydc\.log,' $CDC_CONF \
+                        > $CDC_CONF_TMP
+                ;;
+            *)
+                $SED -e 's,^logger\.destination.*,logger\.destination: syslog,' $CDC_CONF \
+                        > $CDC_CONF_TMP
+                ;;
+        esac
+        
+        diff $CDC_CONF $CDC_CONF_TMP > /dev/null 2>&1
+        is_file_modified=$?
+
+        if [ $is_file_modified -eq 0 ] ; then    # Not modified
+           rm -f $CDC_CONF_TMP
+        else
+           $ECHO "Configure log destination in ${CDC_CONF}"
+           mv -f $CDC_CONF_TMP $CDC_CONF
+           restore_context ${CDC_CONF}
+        fi
+    fi
+
+    $SED -e "s/^$1 *[:=].*/$1: $2/" $CDC_CONF > $CDC_CONF_TMP
+    
+    diff $CDC_CONF $CDC_CONF_TMP > /dev/null 2>&1
+    is_file_modified=$?
+
+    if [ $is_file_modified -eq 0 ] ; then    # Not modified
+        rm -f $CDC_CONF_TMP
+        return 1
+    else
+        $ECHO "Configure log level in ${CDC_CONF}"
+        mv -f $CDC_CONF_TMP $CDC_CONF
+        chmod a+r $CDC_CONF
+        restore_context ${CDC_CONF}
+
+        # Not run adreload if not joined.
+        if [ ! -f "/var/centrifydc/CDC_ADJOIN_IN_PROGRESS" -a -f "/var/centrifydc/kset.host" ] ; then
+        $ECHO "Reload $CDC_CONF"
+        $CDC_RELOAD
+        else
+            $ECHO "Machine is not joined to any domain."
+        fi
+        return 0
+    fi
+}
+
+#
+# Ensure CDC_LOG exists if get_log_status is on 
+# 1. if log status is off, then do nothing.
+# 2. if log status is on, and CDC_LOG doesn't exist, create it and restart syslog.
+#
+check_cdc_log()
+{
+    current_status=`get_log_status`
+    if [ "$current_status" = "off" -o -f $CDC_LOG ]; then
+        return 0
+    fi
+        
+    sleep 1
+    if [ ! -f $CDC_LOG ]; then
+        $ECHO "$CDC_LOG does not exist. Creating now."
+        touch $CDC_LOG
+        restore_context $CDC_CLIENT_LOG
+        notify_syslog_daemon
+    fi
+
+}
+
+#
+# Change debug logging of a module to a particular log level.
+# @param 1  module name or action: on|off|(values in $LOGLEVELLIST)
+# @param 2  if param 1 is module name, then param2 is action
+# @return   0 for successful
+#
+configure_debug()
+{
+    local_modulename=""
+    local_modulevalue=""
+    local_current_status=""
+    
+    if [ $# -eq 1 ] ; then
+        local_modulename="log"
+        local_modulevalue="$1"
+    else
+        local_modulename="log.$1"
+        local_modulevalue="$2"
+    fi
+    
+    if [ "$local_modulevalue" = "on" ] ; then
+        local_modulevalue="DEBUG"
+    elif [ "$local_modulevalue" = "off" ] ; then
+        local_modulevalue=`load_prev_log_level_off`
+    fi
+
+    check_module_value $local_modulevalue
+    local_log_status=`log_level_to_status $local_modulevalue`
+    check_privilege $local_log_status
+    
+    local_current_status=`grep "^$local_modulename *[:=]" $CDC_CONF | \
+                        $SED -n -e "$ s/^$local_modulename *[:=] *\([a-zA-Z]*\) *$/\1/p"`
+
+    if [ "$local_current_status" = "$local_modulevalue" ] ; then
+        return 0
+    fi
+    
+    check_files
+    
+    check_module_name $local_modulename $local_modulevalue
+    update_syslog_limit $local_modulevalue
+    if [ $USE_SYSTEMD_JOURNAL -eq 0 ]; then
+        update_syslog_config_file $local_log_status
+    else
+        update_systemd_journal_config_file $local_log_status
+    fi
+    update_cdc_config_file $local_modulename $local_modulevalue
+    if [ $USE_SYSTEMD_JOURNAL -eq 0 ]; then
+        check_cdc_log
+    fi
+    save_cur_log_level_off
+}
+
+#
+# Clear centrifydc.log
+#
+clear_logs()
+{
+    check_privilege clear
+    if [ -f "$CDC_LOG" ]; then
+        cat /dev/null > $CDC_LOG
+        if [ $? -eq 0 ] ; then
+            $ECHO "Cleared ${CDC_LOG}"
+        else
+            $ECHO "Can not clear ${CDC_LOG}"
+        fi
+    else
+        $ECHO "${CDC_LOG} does not exist"
+    fi 
+   
+    cat /dev/null > $CDC_CLIENT_LOG
+    if [ $? -eq 0 ] ; then
+        $ECHO "Cleared ${CDC_CLIENT_LOG}"
+    else
+        $ECHO "Can not clear ${CDC_CLIENT_LOG}"
+    fi
+    
+    notify_syslog_daemon
+}
+
+#
+# Show current status
+#
+status()
+{
+    if [ $# -eq 0 ] ; then
+        all_log_status
+    else
+        local_modulename="$1"
+        if [ "$local_modulename" != "log" ] ; then
+            local_modulename="log.$local_modulename"
+        fi
+
+    local_logvalue="`get_log_level`"
+    case $local_logvalue in
+        DEBUG)
+                $ECHO "Centrify DirectControl debug logging is on";;
+        INFO)
+                $ECHO "Centrify DirectControl debug logging is off";;
+        *)
+            $ECHO "Centrify DirectControl logging is at level $local_logvalue";;
+    esac
+    fi
+}
+
+#
+# Show current all log status information
+#
+all_log_status()
+{
+    $ECHO "Centrify DirectControl debug status:"
+    $ECHO `grep '^log *[:=]' $CDC_CONF`
+    $ECHO "`grep '^log[.]1*' $CDC_CONF`"
+}
+
+# We pre-configure logadm on Solaris and logrotate on Linux, but HPUX
+# doesn't have such an animal: issue a warning.
+issue_hp_logging_on_warning()
+{
+    if [ "$TARGET_OS" = "hpux" ]; then
+        warning "HPUX does not have automated log rotation facilities."
+        warning "  This may cause your system to run out of disk space."
+    fi
+}
+
+#
+# Load previous log level for off
+#
+load_prev_log_level_off()
+{
+    if [ -f "$PREV_LOG_SETTING_OFF" ]; then
+        prev_log_level=`cat "$PREV_LOG_SETTING_OFF"`
+    fi
+    
+    case $prev_log_level in
+        INFO|WARNING|ERROR|FATAL|DISABLED)
+            echo "$prev_log_level"
+            ;;
+        *)
+            echo "INFO"
+    esac
+}
+
+#
+# Save the log level for off
+#
+save_cur_log_level_off()
+{
+    current_log_level=`get_log_level`
+    
+    case $current_log_level in
+        INFO|WARNING|ERROR|FATAL|DISABLED)
+            echo "$current_log_level" > "$PREV_LOG_SETTING_OFF"
+            ;;
+    esac
+}
+
+#
+# Compare two version numbers and see if the first version is the same or newer 
+# than the second version
+#
+# @param 1  the first version to be compared (in x.x.x.x format)
+# @param 2  the second version to be compared (in x.x.x.x format)
+# @returns  0 if the first version is the same as the second version or newer
+#           1 if the first version is older than the second version
+#
+
+is_version_the_same_or_newer()
+{
+    ver1=$1
+    ver2=$2
+
+    set -- `echo "$ver1" | $SED 's/\./ /g'`
+    major1=$1
+    minor1=$2
+    trivia1=$3
+    rev1=$4
+    if [ "$major1" = "" ] ; then major1=0; fi
+    if [ "$minor1" = "" ] ; then minor1=0; fi
+    if [ "$trivia1" = "" ] ; then trivia1=0; fi
+    if [ "$rev1" = "" ] ; then rev1=0; fi
+
+    set -- `echo "$ver2" | $SED 's/\./ /g'`
+    major2=$1
+    minor2=$2
+    trivia2=$3
+    rev2=$4
+    if [ "$major2" = "" ] ; then major2=0; fi
+    if [ "$minor2" = "" ] ; then minor2=0; fi
+    if [ "$trivia2" = "" ] ; then trivia2=0; fi
+    if [ "$rev2" = "" ] ; then rev2=0; fi
+
+    if [ $major1 -lt $major2 ] ; then
+        return 1
+    elif [ $major1 -gt $major2 ] ; then
+        return 0
+    fi
+
+    if [ $minor1 -lt $minor2 ] ; then
+        return 1
+    elif [ $minor1 -gt $minor2 ] ; then
+        return 0
+    fi
+
+    if [ $trivia1 -lt $trivia2 ] ; then
+        return 1
+    elif [ $trivia1 -gt $trivia2 ] ; then
+        return 0
+    fi
+
+    if [ $rev1 -lt $rev2 ] ; then
+        return 1
+    fi
+
+    return 0
+}
+
+#
+# Get syslog daemon location even when PATH does not include /sbin and 
+# /usr/sbin
+#
+# @returns  full path if syslog daemon is found
+#           empty string if syslog daemon is not found
+#
+
+get_syslog_daemon_path()
+{
+    syslogd_path=""
+
+    if [ -x "/sbin/${SYSLOG_DAEMON}" ] ; then
+        syslogd_path=/sbin/${SYSLOG_DAEMON}
+    elif [ -x "/usr/sbin/${SYSLOG_DAEMON}" ] ; then
+        syslogd_path=/usr/sbin/${SYSLOG_DAEMON}
+    elif [ -x "`which ${SYSLOG_DAEMON} 2>&1`" ] ; then
+        syslogd_path=`which ${SYSLOG_DAEMON}`
+    fi
+
+    echo $syslogd_path
+}
+
+#
+# Check if rsyslog supports rate limiting according to its version
+#
+# @returns  0 if supported
+#           1 if not supported
+#
+
+rsyslog_supported_rate_limiting()
+{
+    rsyslogd_path=`get_syslog_daemon_path`
+    if [ "$rsyslogd_path" = "" ] ; then
+        return 1
+    fi
+
+    current_version=`$rsyslogd_path -v 2>/dev/null | \
+                     awk -F " " '/rsyslogd/ {print substr($2, 1, length($2)-1)}'`
+    if [ "$current_version" = "" ] ; then
+        current_version="0.0.0.0"
+    fi
+
+    # Rate limiting is supported on rsyslogd v5.7.1 or later
+    min_version="5.7.1"
+
+    is_version_the_same_or_newer $current_version $min_version
+    return $?
+}
+
+prepare_tmp_files()
+{
+    if [ $UID -ne 0 ]; then
+        return 1
+    fi
+
+    TMPDIR=`echo get_temp_dir | /usr/bin/adedit`
+    if [ $? -ne 0 ]; then
+        error "Cannot create temp directory."
+    fi
+
+    SYSLOG_CONF_TMP="${TMPDIR}/syslog.addebug.$$"
+    CDC_CONF_TMP="${TMPDIR}/centrifydc.addebug.$$"
+
+    return 1
+}
+
+# <<< Function definition end <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+
+
+# >>> Main program >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+
+get_uid
+
+prepare_tmp_files
+
+identify_operating_system
+
+# To check if the OS is FC20 which will use systemd journal for logging.
+if [ $TARGET_OS = "linux" ]; then
+    KERNEL_RELEASE=`uname -r`
+    FEDORA_CORE_VERSION=${KERNEL_RELEASE#*fc}
+    if [ $KERNEL_RELEASE != $FEDORA_CORE_VERSION ]; then
+        FEDORA_CORE_VERSION=${FEDORA_CORE_VERSION%%.*}
+        if [ $FEDORA_CORE_VERSION -ge 20 ]; then
+            USE_SYSTEMD_JOURNAL=1
+        fi
+    fi
+fi
+
+if [ $USE_SYSTEMD_JOURNAL -eq 0 ]; then
+    update_variables
+fi
+
+if [ $# -gt 3  ] ; then
+    usage
+elif [ $# -eq 3 ] ; then
+    if [ "$1" != "set" ] ; then
+        usage
+    fi
+    configure_debug $2 $3
+    status $2 
+elif [ $# -eq 2 ] ; then
+    configure_debug $2
+    status log 
+else
+    case "$1" in
+        on)
+            issue_hp_logging_on_warning
+            configure_debug on
+            status log
+            ;;
+        off)
+            configure_debug off
+            status log
+            ;;
+        clear)
+            if [ $USE_SYSTEMD_JOURNAL -eq 0 ]; then
+                clear_logs
+                status log
+            else
+                usage
+            fi
+            ;;
+        status)
+            status
+            ;;
+        journal)
+            if [ $USE_SYSTEMD_JOURNAL -eq 0 ]; then
+                usage
+            else
+                notify_systemd_journal_daemon
+            fi
+            ;;
+        syslog)
+            if [ $USE_SYSTEMD_JOURNAL -eq 0 ]; then
+                notify_syslog_daemon
+            else
+                usage
+            fi
+            ;;
+        "")
+            if [ "$program_name" = "syslog_reload" ] && [ $USE_SYSTEMD_JOURNAL -eq 0 ]; then
+                notify_syslog_daemon
+            else
+                status log
+            fi
+            ;;
+        help)
+            usage
+            ;;
+        *)
+            usage
+            ;;
+    esac
+fi
+
+exit 0
+

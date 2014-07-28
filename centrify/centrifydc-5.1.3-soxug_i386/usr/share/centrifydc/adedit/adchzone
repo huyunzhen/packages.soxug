@@ -1,0 +1,204 @@
+#!/bin/sh
+#
+# $Change: 108300 $
+# $Revision: #1 $
+# $DateTime: 2014/01/20 12:11:06 $
+#
+# change zone which we are joined in the same domain.
+#   The original joined zone should be classic one and the destination is ng one
+# adchzone -z <dn of zone> [-u <user>] [-p <passwd>] [-v]
+# -d destination zone
+# -u domain user  default administrator
+# -p the user relative passwd
+# -v verbose
+#
+# When no username and password are given, kerberos credential of current user will be used.
+# \
+exec adedit "$0" ${1+"$@"}
+package require ade_lib
+
+proc usage {msg} {
+    puts $msg
+    puts "Use this script to migrate a joined computer from its original classic \
+          zone to a hierarchical zone."
+    puts {usage: -z <dn of zone> [-u <user>] [-p <passwd>] [-v]}
+    exit 1
+}
+proc Error {msg} {
+    puts "Error: $msg"
+    exit 1
+}
+proc verbose {msg} {
+    if { $::VERBOSE } {
+        puts "$msg"
+    }
+}
+proc change_zone {destzone} {
+    # computer name.  # zone computer format: sAMAccountName$@domain 
+    set domain   [get_adinfo domain]
+    set host [get_adinfo host]
+    set idx [string first $domain $host]
+    set computer_name [string range $host 0 [expr $idx-2]]
+    set computer "$computer_name\$@$domain"
+
+    # computer at the original zone
+    set original_zone [get_adinfo zone]
+    select_zone $original_zone
+    if {[catch {select_zone_computer $computer}]} {
+        select_zone $destzone
+        if {[catch {select_zone_computer $computer}]} {
+            # admigrate will migrate the zone computer from current zone to 
+            # target if there exists some computer-level role assignments.
+            # so only prompt error when zone computer is not in current and target zone.
+            Error "Computer($computer) is not found in current zone($original_zone). \
+                Try adleave and then rejoin with adjoin."
+        } else {
+            # the zone computer is in target zone. We are done.
+            verbose "Computer($computer) is found in destination zone($destzone)"
+            return
+        }
+    } else {
+        # get some zone_computer fields to copy
+        verbose "Computer($computer) found in original zone($original_zone)"
+        set srcenabled [get_zone_computer_field enabled ]
+        set srccpus    [get_zone_computer_field cpus    ]
+        push
+
+        #copy the computer from the original zone to the destination zone
+        select_zone $destzone
+        if {[catch {
+                new_zone_computer $computer; 
+                set_zone_computer_field enabled $srcenabled;
+                set_zone_computer_field cpus    $srccpus   ;
+                save_zone_computer
+                # get computer sd 
+                select_object [principal_to_dn $computer]
+                set sid [get_object_field sid]
+                set kwdGuid [get_schema_guid Keywords] 
+                set disGuid [get_schema_guid Display-Name]
+                select_zone $destzone; 
+                select_zone_computer $computer
+                select_object [get_zone_computer_field dn]
+                set sd [get_object_field sd]
+                # Precreated computer account, Zone/Computer/scp, This object, Generic Read
+                set sd [add_sd_ace $sd "A;;GR;;;$sid"]
+                # Precreated computer account, Zone/Computer/scp, This object, Write keywords property
+                set sd [add_sd_ace $sd "OA;;WP;$kwdGuid;;$sid"]
+                # Precreated computer account, Zone/Computer/scp, This object, Write displayName property
+                set sd [add_sd_ace $sd "OA;;WP;$disGuid;;$sid"]
+                set_object_field sd $sd
+                save_object
+        } errmsg ]} {
+            Error "Fail when creating computer at new zone($destzone):$errmsg"
+        } else {
+            verbose "Created computer($computer) at destination zone($destzone)."
+        }
+        pop
+        
+        # delete the zone computer at original zone
+        # failed to delete the original zone computer
+        if {[catch delete_zone_computer]} {
+            # rollback the new zone computer 
+            if {[catch {
+                    select_zone $destzone; 
+                    select_zone_computer $computer; 
+                    delete_zone_computer} errmsg] } {
+                Error "Failed to delete computer in original zone($original_zone). \
+                    \n\tAlso failed to delete the new created zone computer \
+                    in destination zone($destzone): $errmsg"
+            } else {
+                Error "Failed to delete computer in original zone($original_zone)."
+            }
+        } else {
+            verbose "Deleted computer($computer) in original zone($original_zone)."
+        }
+    }
+}
+
+#execute start
+# Firstly, check whether the user has root priviledge, if no, exit with error.
+set id_output [exec id]
+regexp {uid=(\d+)} $id_output - curr_uid
+if { $curr_uid != 0 } {
+    Error "adchzone may only be run by root"
+}
+if {[getopt argv -z DEST_ZONE] == 0} { 
+    usage "Missing destination zone"
+}
+
+set VERBOSE [getopt argv -v] 
+set DOMAIN [get_adinfo domain]
+# if not joined any domain,when get_adinfo error occure
+#if {$domain == "Not joined to any domain"} {
+#    usage "Make sure the computer has joined to a domain."
+#}
+set DESTDOMAIN [domain_from_dn $DEST_ZONE]
+if {[string equal -nocase $DOMAIN $DESTDOMAIN] == 0 } { 
+    usage "The destination zone domain($DESTDOMAIN) must be in the same AD \
+        domain as the original zone domain($DOMAIN)." 
+}
+set SOURCE_ZONE [get_adinfo zone]
+if {[string equal -nocase $SOURCE_ZONE $DEST_ZONE]} {
+    usage "The destination zone($DEST_ZONE) cannot be the same as the orignal zone."
+}
+
+set USER "" 
+getopt argv -u USER
+set PASSWD ""
+getopt argv -p PASSWD
+set errmsg ""
+
+if { $USER == "" && $PASSWD == ""} {
+    set rc [catch {bind $DOMAIN} errmsg]
+    puts $DOMAIN
+    if { [string match "No credentials found*" $errmsg] } {
+       Error "Password is required"
+       exit 1
+    } elseif { [string match "*Preauthentication failed*" $errmsg] } {
+       Error "Invalid username or password"
+       exit 1
+    }
+} elseif { $USER == "" } {
+    set rc [catch {bind $DOMAIN administrator $PASSWD} errmsg]
+    if { [string match "*Preauthentication failed*" $errmsg] } {
+       Error "Invalid username or password"
+       exit 1
+    }
+} elseif { $PASSWD == "" } {
+    set rc [catch {bind $DOMAIN $USER} errmsg]
+    if { [string match "*Preauthentication failed*" $errmsg] } {
+       Error "Invalid username or password"
+       exit 1
+    }
+} else {
+    set rc [catch {bind $DOMAIN $USER $PASSWD} errmsg]
+    if { [string match "*Preauthentication failed*" $errmsg] } {
+       Error "Invalid username or password"
+       exit 1
+    }
+}
+
+#check zone type
+select_zone $SOURCE_ZONE
+set ztype [get_zone_field type]
+if {[string match "classic*" $ztype] != 1} {
+   usage "the original zone ($SOURCE_ZONE) must be a classic version 3 \
+       or classic version 4 zone."
+}
+select_zone $DEST_ZONE
+set ztype [get_zone_field type]
+if {[string equal "tree" $ztype] != 1} {
+    usage "The destination zone ($DEST_ZONE) must be a hierarchical zone."
+}
+
+# change zone 
+change_zone $DEST_ZONE
+
+##adflush this computer, get_object_field guid swap bytes add a new api
+# exec sudo /usr/sbin/adflush -O [gof guid-printable]
+verbose "Restarting adclient..."
+exec -ignorestderr /usr/share/centrifydc/bin/centrifydc stop
+exec -ignorestderr /usr/sbin/adflush --force
+exec -ignorestderr /usr/share/centrifydc/bin/centrifydc start
+
+#execute end

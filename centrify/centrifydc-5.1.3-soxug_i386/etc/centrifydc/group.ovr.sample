@@ -1,0 +1,30 @@
+# 
+# This sample file shows the group override syntax that can be used
+# on a per-machine basis for fine control over group entry values.
+# This file should be managed through the Group Policy interface.
+#
+# The syntax is
+#
+# [+,-][group]:name:passwd:gid:members
+#
+# Any field which is not specified will remain unchanged.  Groups can be named
+# by Unix zone name, AD canonical name, or samAccountName[@domain.name]
+# The group must be zone enabled.
+#
+# Overriding the password hash field will be ignored.
+#
+# Note that the plus and minus entries are evaluated in order from first 
+# to last with the first match taking precedence. 
+#
+# NOTE: If you manually create the group.ovr file, you must include
+# the following as the last line in the file: +::::  
+#
+# NOTE: adflush MUST be run after changing this file
+#
+# An empty (or non-existant) file is the equivalent of adding one line: +::::
+#
+-webusers@local.domain
++Domain Admins:root::0:
++staff::::jdoe,bsmith,frank
++local.domain/Users/Domain Users:users::500:
++::::

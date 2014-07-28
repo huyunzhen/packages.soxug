@@ -1,0 +1,1236 @@
+#!/bin/sh
+#
+# $Change: 108300 $
+# $Revision: #1 $
+# $DateTime: 2014/01/20 12:11:06 $
+#
+# admigrate -in <dn of source classic zone> -z <dn of target zone>  
+#           -config <config file> [-hz <dn of parent zone>] [-f]          
+#           [-users] [-groups] [-nismaps] [-privileges]  [-v] [-n]
+#   [-users] [-groups] [-nismaps] [-privileges]
+#     The upper items all migrate by default, 
+#     otherwise just migrate the specified.
+#   -in <dn of classic source zone>
+#     a classic zone which is the source zone
+#   -z <dn of target zone>
+#     the destination zone will be created as a hierarchical zone.
+#     The profile migrate from inzone.
+#   [-hz <dn of parent zone>]
+#     Set a hierarchical zone as destination zone's parent
+#   [-v] verbose
+#   [-n] no check
+#   [-f] Create the destination zone,
+#        if the zone already exists,deleted first. 
+#   -config <config file>
+#       the config file is actually a tcl file, 
+#       to bind to single or multi domain(s)
+#       format:   bind $DOMAIN $USER $PASSWORD
+#       eg: the contents of the config file.
+#           bind smoke2k3.centrify.test administrator xxxx
+#           bind child12k3.smoke2k3.centrify.test administrator xxxx
+#       ------------------------------------------------------------
+#       it must establish bindings then can select_zone $zone
+#       	make sure you have bindings to all domains 
+#       	- child zones may be in different domains
+#       	- users may be in different domains (or forests)
+#       	- in most cases you should turn cache on too
+# 
+# it is assumed that the same user name can be used for all bindings
+# \
+exec adedit "$0" ${1+"$@"}
+package require ade_lib
+
+proc usage {msg} {
+    puts "$msg"
+    puts {usage:-in <dn of source classic zone> -z <dn of target zone>    }
+    puts {      -config <config file> [-hz <dn of parent zone>] [-f]      } 
+    puts {      [-users] [-groups] [-nismaps] [-privileges] [-v] [-n]     }
+    exit 1
+}
+
+proc GetZoneName {path} {
+    return [string range [get_rdn $path] 3 end]
+}
+
+proc GetErrorMessage {msg {errmsg ""}} {
+    if { $errmsg == "" } {
+        return "Error: $msg"
+    } else {
+        return "Error: $msg\n       $errmsg"
+    }    
+}
+
+proc ErrorSkip {msg {errmsg ""}} {
+    set error_msg [GetErrorMessage $msg $errmsg]
+    # only give an error once
+    if { ![dict exists $::Messages $error_msg] } {
+        puts $error_msg
+        dict set ::Messages $error_msg 1
+        incr ::NoOfErrors
+    }
+}
+
+proc ErrorExit {msg {errmsg ""}} {
+    puts [GetErrorMessage $msg $errmsg]
+    exit 1
+}
+
+proc verbose {msg} {
+    if { $::verbose } {
+        puts "$msg"
+    }
+}
+
+proc Warning {msg} {
+    set warning_msg "Warning: $msg"
+    # only give a warning once
+    if { ![dict exists $::Messages $warning_msg] } {
+        puts $warning_msg
+        dict set ::Messages $warning_msg 1
+        incr ::NoOfWarnings
+    }
+}
+
+# Check if $name is a valid name for role/dz/pam name in h-zone
+# Only 0-9, A-Z, a-z, -, _, " ", is valid.
+proc IsNameValid {name} {
+    return [regexp {^[-_0-9A-Za-z ]+$} $name]
+}
+
+# Convert the invalid characters to '-'
+proc ConvertName {name} {
+    return [regsub -all {[^-_0-9A-Za-z ]} $name -]
+}
+
+# Convert name in form of UPN[+n] to UPN
+proc GetUPN {name} {
+    regexp {([^+]+)(\+\d+)?} $name - upn
+    return $upn
+}
+
+# This function will do get_object_field and get the first element
+# Since get_object_field always return a list, it may cause problem
+# when used in scalar context. So always use GetObjectField if the field
+# has only 1 element.
+proc GetObjectField { field } {
+    return [lindex [get_object_field $field] 0]
+}
+
+# zone_users: dictionary
+# key: zone user, value: if the user is enabled in the source_zone 
+# (1:all alias users enabled, 0:all disabled, true:some enabled, some disabled)
+set zone_users false
+proc GetZoneUsers {} {
+    global zone_users
+    if { $zone_users == false } {
+        set zone_users [dict create]
+        select_zone $::inzone
+        foreach user [get_zone_users] {
+            set upn [GetUPN $user]
+            if {[catch {select_zone_user $user} errmsg]} {
+                Warning "Failed to select zone user $user: $errmsg"
+                # "Pending import users" can cause this exception (in that case, $user=="*<unknown user>").  Although this is due to incomplete
+                # operation from user, we should not crash. 
+                # other conditions may also cause exception.  
+                continue
+            }
+            set login [get_zone_user_field enabled]
+            
+            # It is possible that the same aduser has two or more alias users,
+            # some of them are enabled, while others are not.
+            # In this case, if any of the alias users are enabled, we allow the user to login
+            if { ![dict exists $zone_users $upn] } {
+                dict set zone_users $upn $login
+            } elseif { [dict get $zone_users $upn] != $login  } {
+                dict set zone_users $upn true
+            }
+        }
+    }
+    return $zone_users
+}
+
+# This function will strip the $name, get the objectGUID using $dn, and return <stripped name>-<objectGUID>
+proc ConvertNameFromDN {dn name} {
+    select_object $dn
+    # guid is binary
+    set guid [GetObjectField objectGUID]
+    binary scan [encoding convertto identity $guid] H* result
+    return "[ConvertName $name]-$result"
+}
+
+# Create a new role assignment in $zone
+# using $upn and $role. warn out when it failed.
+# and will verbose the result
+proc NewRoleAssignment {upn role zone {from {}} {to {}}} {
+    if { [catch {
+        select_zone $zone
+        new_role_assignment $upn
+        set_role_assignment_field role $role
+        if { $from != "" } { sraf from $from }
+        if { $to != "" } { sraf to $to }
+        save_role_assignment
+    } errmsg] } {
+        ErrorSkip "Failed to migrate role assignment($upn/$role/$zone)." $errmsg
+        return 0
+    } else {
+        verbose "Assign role($role) to $upn at $zone."
+        return 1
+    }
+}
+# old_name is the command name (dz/rs) in the source zone.
+# This function will return the dz name in the target zone
+# given the old_name. If old_name is valid, it is returned.
+# Else, <stripped name>-<objectGUID> will be returned instead
+proc HZGetCommandName {old_name source_zone} {
+    if { [IsNameValid $old_name] } {
+        return $old_name
+    }
+    select_zone $source_zone
+    # checkDZ already checked that there is no name collision of rs and dz
+    # so just try if the old_name is rs. If not, it is dz.
+    if { ![catch { select_rs_command $old_name }] } {
+        set dn [get_rsc_field dn]
+    } else {
+        select_dz_command $old_name 
+        set dn [get_dzc_field dn]
+    }
+    return [ConvertNameFromDN $dn $old_name]
+}
+
+# old_name is the pam app name in the source zone.
+# This function will return the pam name in the target zone
+# given the old_name. If old_name is valid, it is returned.
+# Else, <stripped name>-<objectGUID> will be returned instead
+proc HZGetPamName {app_name pam source_zone} {
+    if { [IsNameValid $app_name] } {
+        return $app_name
+    }
+    # If the app name is not valid, it will be renamed to <stripped name>-<objectGUID>. So
+    # we need to get the object GUID from the $source_zone
+    select_zone $source_zone
+    select_pam_app $pam
+    set dn [get_pam_field dn]
+    return [ConvertNameFromDN $dn $app_name]
+}
+
+proc CheckRoleName { role_name warn } {
+    # There will be 4 base roles at target zone 
+    # Roles,login and listed, are created when create hierarchical zone
+    # The other 2 roles login_at_roles and login_all_apps create when dz data migrate
+    if { ![IsNameValid $role_name] } {
+        if { $warn } {
+            Warning "Invalid characters found in role name, role($role_name) will be renamed.\
+            Only alphanumeric, space, '-' and '_' characters are allowed in role name in hierarchical zone."
+        }
+        return 0
+    } elseif { [dict exists $::role_reserved [string tolower $role_name]]} {
+        if { $warn } {
+            Warning "The following roles are reserved in hierarchical zone: unix login, listed, login_at_roles and login_all_apps.\
+            role($role_name) will be renamed in the hierarchical zone."
+        }
+        return 0
+    } else {
+        return 1 
+    }
+}
+
+# old_name is the role name in the source zone.
+# This function will return the role name in the target zone
+# given the old_name. If old_name is valid, it is returned.
+# Else, <stripped name>-<objectGUID> will be returned instead
+proc HZGetRoleName {old_name source_zone {warn 0}} {
+    if { [CheckRoleName $old_name $warn] } {
+        return $old_name 
+    }
+    # If the role name is not valid, it will be renamed to <stripped name>-<objectGUID>. So
+    # we need to get the object GUID from the $source_zone
+    select_zone $source_zone
+    select_role $old_name
+    set dn [get_role_field dn]
+    return [ConvertNameFromDN $dn $old_name]
+}
+
+# old_name: role name in source_zone
+# This function select the converted role in the target_zone
+# Returns 1 if the name in source_zone and target_zone are the same
+proc HZSelectRole {old_name source_zone target_zone} {
+    set new_name [HZGetRoleName $old_name $source_zone]
+    select_zone $target_zone
+    select_role $new_name
+    return [string match -nocase $new_name $old_name]
+}
+
+# old_name: role name in source_zone
+# This function create a new role in the target_zone (with the name converted)
+proc HZNewRole {old_name source_zone target_zone} {
+    set new_name [HZGetRoleName $old_name $source_zone 1]
+    select_zone $target_zone
+    new_role $new_name
+}
+
+# set the correct description and displayname for nismap in target_zone
+# since automount and generic map can have arbitrary names,
+# it is not possible for adedit to create them correctly using new_nis_map
+proc SetNisMapType {source_zone target_zone nismap} {
+    select_zone $source_zone
+    select_nis_map $nismap
+    select_object [get_nis_map_field dn]
+    set displayname [GetObjectField displayname]
+    set description [GetObjectField description]
+    select_zone $target_zone
+    select_nis_map $nismap
+    select_object [get_nis_map_field dn]
+    set_object_field displayname $displayname
+    set_object_field description $description
+    save_object
+}
+
+# This function is run is DZ is enabled and unless -n flag is used
+# It will check the following:
+# the role existed in old zone: unix login, listed, login_at_roles, login_all_apps
+# command: dz and rs command name
+# pam application:login-all, *, (!*), synbols except alpha,digit,sapce '_' '-'
+proc checkDZ {source_zone} {
+    select_zone $source_zone
+    set all_roles [get_roles]
+    foreach role $all_roles {
+        CheckRoleName $role 1
+    }
+
+    # rs-command, pc-command may be at the same name in hierarchical zone
+    # thought they are different now.
+    set rs_commands [get_rs_commands]
+    set dz_commands [get_dz_commands]
+    set rs_dict [dict create]
+    foreach rsc $rs_commands {
+        dict set rs_dict [string tolower $rsc] 1
+        if { ![IsNameValid $rsc] } {
+            Warning "Invalid characters found in restricted command name, rs_command($rsc) will be renamed.\
+            Only alphanumeric, space, '-' and '_' characters are allowed in restricted command name in hierarchical zone."
+        }
+    }
+    
+    foreach dzc $dz_commands {
+        if { ![IsNameValid $dzc] } {
+            Warning "Invalid characters found in privileged command name, dz_command($dzc) will be renamed.\
+            Only alphanumeric, space, '-' and '_' characters are allowed in privileged command name in hierarchical zone."
+        }
+        
+        if { [dict exists $rs_dict [string tolower $dzc]] } {
+            ErrorExit "Name $dzc already exists! Please change rs_command($dzc) or\
+             dz_command($dzc)to avoid name conflict error during migration."
+        }
+    }
+    # pam application:login-all,
+    # it will ignore the initial spaces
+    # pam application:symbols except a-z|A-Z|0-9|-| |_ , sample: * $#
+    set odd_symbols 0
+    foreach pamApp [get_pam_apps] {
+        select_pam_app $pamApp
+        set application [get_pam_field application]
+        #application:login-all
+        if { [string equal -nocase $application "login-all"] == 1 } {
+            ErrorExit "For migration, pam's application login-all is\
+                reserved for hierarchical zone."
+        }
+        #application: * and symbols except alpha,digit,space,'-' and '_'
+        if { ![IsNameValid $application] } {
+            if { $application == "*" } {
+                Warning "If pam's application is *, it will be used\
+                    as login-all after migration."
+            } else {
+                Warning "Invalid characters found in pam application, pam($application) will be renamed.\
+                Only alphanumeric, space, '-' and '_' characters are allowed in pam application in hierarchical zone."
+            }
+        }
+    }
+}
+
+proc CreateTreeZone {name} {
+    set ou [string match -nocase ou=* $name]
+    if { $ou == 1 } {
+        create_zone -ou tree $name
+    } else {
+        create_zone tree $name
+    }
+}
+
+# Give an object DN, search if the cn or ou type of the object exists.
+# If so, return the existing object. Else return null.
+proc GetExistingObject { object } {
+    set remaining [string range $object 2 end]
+    set ou_container "ou$remaining"
+    set cn_container "cn$remaining"
+    set no_ou [catch {slo $ou_container}]
+    set no_cn [catch {slo $cn_container}]
+    if { $no_ou && $no_cn } {
+        return
+    } elseif { $no_ou } {
+        return $cn_container
+    } else {
+        return $ou_container
+    }
+    # impossible for no_ou and no_cn both to be zero.
+}
+
+# Create a hierarchical zone whose schema is rfc by default,if the zone is not existence
+# Delete and recreate a hierarchical zone, if -f options available 
+# Set zone's parent if exist
+proc create_target_zone {target_zone ngzone bool_force} {
+    # It is not found the zone at the bound domain(s)
+    set tzone [GetExistingObject $target_zone]
+    if { $tzone == "" } {
+        # Failed to create zone 
+        if {[catch {CreateTreeZone $target_zone} errmsg]} {
+            ErrorExit "Can not create zone($target_zone)." $errmsg
+        } else {
+            verbose "Created $target_zone."
+        }
+    } else {
+        # The zone already exist.
+        set equal [expr {[string tolower $tzone] == [string tolower $target_zone]}]
+        if { $bool_force && $equal } {
+            if {[catch {delete_sub_tree $target_zone; CreateTreeZone $target_zone} errmsg]} {
+                ErrorExit "Failed to delete and recreate zone($target_zone)." $errmsg
+            } else {
+                verbose "Deleted and recreated zone($target_zone)."
+            }
+        } elseif { $equal } {
+            ErrorExit "The zone($target_zone) already exists,\
+                please delete it manually or use option \[-f\] to override."
+        } else {
+            ErrorExit "There is another container($tzone) which prevents the creation of zone($target_zone),\
+            please delete it manually."
+        }
+    }
+    if {$ngzone != ""} {
+        if { [catch {select_zone $target_zone; set_zone_field parent $ngzone;save_zone } errmsg]} {
+            ErrorExit "Failed to set the parent zone($ngzone)." $errmsg
+        }
+        verbose "Set parent zone($ngzone) for zone($target_zone)."
+    }
+}
+
+proc zone_migrate {source_zone target_zone} {
+    set all_fields {availableshells description gidnext 
+        gidreserved masterdc nisdomain pwsync truncatename
+        uidnext uidreserved}
+    foreach field $all_fields {
+        if { [catch { 
+            slz $source_zone
+            set value [gzf $field]
+            slz $target_zone
+            szf $field $value
+            save_zone
+        }] } {
+            ErrorSkip "Failed to set $field\($value\) in $target_zone"
+        }
+    }
+}
+#
+# Users migrate
+# If parent zone does not eixst, migrate all user to the destination zone.
+# If exist, we must check the user's profiles first.
+#     if the user is already in parent zone, 
+#         ignore the user which will be shared by child zone.
+#     else create the user at parent zone.
+# Set the user's role assignment login/listed according the classic zone 
+# user's enable field
+proc users_migrate {source_zone target_zone parent_zone} {
+    if { $parent_zone != "" } {
+        select_zone $parent_zone
+        set sfu [string match [gzf schema] sfu]
+    }
+    select_zone $source_zone
+    if {[catch {set users [get_zone_users]} errmsg]} {
+        ErrorExit "Got exception when getting zone users from $inzone" $errmsg
+    } else {
+        foreach user $users {
+            # skip orphaned users
+            if {[string equal -length 1 $user "*"]} {
+                set uname ""
+                catch {
+                    slz $source_zone
+                    slzu $user
+                    set uname [gzuf uname]
+                }
+                verbose "Orphan user($uname, $user) is not migrated."
+                continue
+            }
+            set exceptionNo [catch {
+                select_zone $source_zone
+                select_zone_user $user
+                # field: uname uid gid gecos shell home enable(classic zone only)
+                # foreign dn createTime modifyTime -- not migrate 
+                set uname [get_zone_user_field uname]
+                set uid   [get_zone_user_field uid  ]
+                set gid   [get_zone_user_field gid  ]
+                set gecos [get_zone_user_field gecos]
+                set shell [get_zone_user_field shell]
+                set home  [get_zone_user_field home ]
+                set login [get_zone_user_field enabled]
+                if {$gecos == ""} { 
+                    set gecos "%{u:samccountname}" 
+                }
+                # auto private group
+                if { $uid == $gid } {
+                    set gid [expr 0x80000000]
+                }
+                # parent_zone existence
+                if {$parent_zone != ""} {
+                    select_zone $parent_zone
+                    # The user is not existence at the parent zone
+                    if {[catch {select_zone_user $user}]} {
+                        # Create user at parent zone if not sfu else create in parent zone
+                        if { $sfu } {
+                            set uzone $target_zone
+                        } else {
+                            set uzone $parent_zone
+                        }
+                        select_zone $uzone
+                        create_user $user $uname $uid $gid $gecos $home $shell -
+                        verbose "Migrate user($user) to $uzone."
+                    } else {
+                        # Check the user's profiles
+                        set puname [get_zone_user_field uname]
+                        set puid   [get_zone_user_field uid  ]
+                        set pgid   [get_zone_user_field gid  ]
+                        set pgecos [get_zone_user_field gecos]
+                        set pshell [get_zone_user_field shell]
+                        set phome  [get_zone_user_field home ]
+                        # The user's profiles is different between at classic zone
+                        # and parent, so create user at destination zone
+                        if {$uname != $puname ||$uid != $puid 
+                            || $gid != $pgid || $gecos != $pgecos 
+                            || $shell != $pshell || $home != $phome } {
+                            select_zone $target_zone
+                            create_user $user $uname $uid $gid $gecos $home $shell -
+                            verbose "Migrate user($user) to $target_zone. The user has different profiles at parent zone and source zone."
+                        } else {
+                            verbose "Don't migrate user($user) to $target_zone, because the parent zone user will be shared."
+                        }
+                    }
+                } else {
+                    select_zone $target_zone
+                    create_user $user $uname $uid $gid $gecos $home $shell -
+                    verbose "Migrate user($user) to $target_zone."
+                }
+            } errmsg]
+            if { $exceptionNo } {
+                ErrorSkip "Failed to migrate user($user)." $errmsg
+            }
+        }
+    }
+    
+    set zone_users [GetZoneUsers]
+    # If DZ is not enabled, or privileges is not migrated, we set the login/listed rule here.
+    if { !$::dz_enabled || $::privileges == 0 } {
+        dict for {upn login} $zone_users {
+            if {[string equal -length 1 $upn "*"]} { continue }
+            
+            set exceptionNo [catch {
+                if { $login } {
+                    NewRoleAssignment $upn "unix login" $target_zone
+                } else {
+                    NewRoleAssignment $upn listed $target_zone
+                }
+                if { $login == true } {
+                    puts "User($upn) is allowed to login although some of its alias users are disabled."
+                }
+            } errmsg]
+            if { $exceptionNo } {
+                ErrorSkip "Failed to migrate user($user)." $errmsg
+            }        
+        }
+    }    
+}
+# Groups migrate
+proc groups_migrate {source_zone target_zone} {
+    select_zone $source_zone
+    set groups [get_zone_groups]
+    foreach group $groups {
+        #skip orphaned groups
+        if {[string equal -length 1 $group "*"]} {
+            set name ""
+            catch {
+                slz $source_zone
+                slzg $group
+                set name [gzgf name]
+            }
+            verbose "Orphan group($name, $group) is not migrated."
+            continue
+        }
+        set exceptionNo [catch {
+            select_zone $source_zone ;
+            select_zone_group $group ;
+            set name     [get_zone_group_field name] ;
+            set gid      [get_zone_group_field gid ] ;
+            set required [get_zone_group_field required] ;
+            # Create a group at destination zone
+            select_zone $target_zone ;
+            create_group $group $name $gid ;
+            set_zone_group_field required $required ;
+            save_zone_group
+        } errmsg]
+        if {$exceptionNo } {
+            ErrorSkip "Failed to migrate group($group)." $errmsg
+        } else {
+            verbose "Migrate group($group) to $target_zone."
+        }
+    }
+}
+# Nismap migrate: map_entry, nis_map 
+# nismap entry migrate
+proc nismap_entries_migrate {src_nismap src_zone dest_nismap dest_zone} {
+    select_zone $src_zone
+    select_nis_map $src_nismap
+    set mapEntries [get_nis_map_with_comment]
+    # foreach will pass if the list is empty
+    foreach mapEntry $mapEntries {
+        # $mapEntry Format: {key:No value}. Get {key value} to append
+        # key:No --- [lindex $mapEntry 0]  value --- [lindex $mapEntry 1]
+        set exceptionNo [catch {
+            lassign $mapEntry lkey_no value comment
+            set numberStart [expr {[string last : $lkey_no] - 1}]
+            set key         [string range $lkey_no 0 $numberStart]
+            select_zone $dest_zone
+            select_nis_map $dest_nismap
+            add_map_entry_with_comment $key $value $comment
+        } errmsg]
+        if {$exceptionNo} {
+            ErrorSkip "Failed to append map entry:'$key, $value' at $dest_nismap." $errmsg
+        } else {
+            verbose "Appended map entry:'$key, $value' at $dest_nismap." 
+        }
+    }
+}
+proc nismaps_migrate {source_zone target_zone} {
+    select_zone $source_zone
+    set nismaps [get_nis_maps]
+    foreach nismap $nismaps {
+        set exceptionNo [catch {
+            select_zone $target_zone
+            new_nis_map $nismap
+            save_nis_map
+            SetNisMapType $source_zone $target_zone $nismap
+            verbose "Migrate nismap($nismap) to $target_zone." 
+            nismap_entries_migrate $nismap $source_zone $nismap $target_zone
+        } errmsg]
+        if {$exceptionNo} {
+            ErrorSkip "Failed to migrate nismap($nismap)." $errmsg
+        }
+    }
+}
+# ------ privilege migrate ------
+# 
+# Roles migrate
+# There are 4 special roles: login, listed, login_at_roles, login_all_apps
+#   login store the user which is a login user,neither assign to any role
+#   listed store the user which isn't a login user,neither assigns to any role
+#   login_at_roles store the user which is a user but assignment to role(s)
+#   login_all_apps store the user which is only at the role(s) that use all pam accesses.
+# create another 2 roles,login_at_roles and login_all_apps 
+proc roles_migrate {source_zone target_zone} {
+    select_zone $source_zone
+    set roles [get_roles]
+    foreach role $roles {
+        set exceptionNo [catch {
+            select_zone $source_zone
+            select_role $role
+            set timebox     [get_role_field  timebox    ]
+            set sysrights   [get_role_field  sysrights  ]
+            set description [get_role_field  description]
+            HZNewRole $role $source_zone $target_zone
+            set_role_field  timebox     $timebox     
+            set_role_field  sysrights   $sysrights   
+            set_role_field  description $description 
+            save_role
+        } errmsg]
+        if {$exceptionNo != 0} {
+            ErrorSkip "Failed to migrate role($role)." $errmsg
+        } else {
+            verbose "Migrate role($role) to $target_zone."
+        }
+    }
+
+    # Create two new roles
+    set exceptionNo [catch {
+        select_zone $target_zone      
+        new_role login_at_roles
+        set_role_field  sysrights  3 
+        set_role_field  description "The assigned zone user(s)"
+        save_role
+        
+        new_role login_all_apps
+        set_role_field  sysrights  0
+        set_role_field  description "The all pam login user(s)"
+        add_pamapp_to_role login-all
+        save_role
+    } errmsg]
+    if {$exceptionNo != 0} {
+        ErrorSkip "Failed to create the role($role)." $errmsg
+    } else {
+        verbose "Created new role login_at_roles and login_all_apps."
+    }
+}
+# Commands migrate
+# restrict_environment: rs_commands (classic zone)--> dz_commands (ng zone)
+proc rs_commands_migrate {source_zone target_zone} {
+    select_zone $source_zone
+    set rscs [get_rs_commands]
+    foreach rsc $rscs {
+        set exceptionNo [catch {
+            select_zone $source_zone
+            select_rs_command $rsc
+            #cmd path form dzsh_runas pri umask flags description 
+            set cmd         [get_rsc_field cmd        ]
+            set path        [get_rsc_field path       ]
+            set form        [get_rsc_field form       ]
+            set dzsh_runas  [get_rsc_field dzsh_runas ]
+            set pri         [get_rsc_field pri        ]
+            set umask       [get_rsc_field umask      ]
+            set flags       [get_rsc_field flags      ]
+            set keep        [get_rsc_field keep       ]
+            set del         [get_rsc_field del        ]
+            set add         [get_rsc_field add        ]
+            set description [get_rsc_field description]
+            set newCmdName  [HZGetCommandName $rsc $source_zone]
+            select_zone $target_zone
+            new_dz_command $newCmdName
+            set_dzc_field cmd         $cmd         
+            set_dzc_field path        $path        
+            set_dzc_field form        $form        
+            set_dzc_field dzsh_runas  $dzsh_runas  
+            set_dzc_field pri         $pri         
+            set_dzc_field umask       $umask       
+            set_dzc_field flags       $flags       
+            set_dzc_field keep        $keep         
+            set_dzc_field add         $add         
+            set_dzc_field del         $del         
+            set_dzc_field description $description 
+            save_dz_command
+        } errmsg]
+        if {$exceptionNo } {
+            ErrorSkip "Failed to migrate rs_command($rsc)." $errmsg
+        } else {
+            verbose "Migrate rs_command($rsc) to $target_zone."
+        }
+    }
+}
+proc dz_commands_migrate {source_zone target_zone} {
+    select_zone $source_zone
+    set dzcs [get_dz_commands]
+    foreach dzc $dzcs {
+        set exceptionNo [catch {
+            select_zone $source_zone
+            select_dz_command $dzc
+            set cmd         [get_dzc_field cmd        ]
+            set path        [get_dzc_field path       ]
+            set form        [get_dzc_field form       ]
+            set dzdo_runas  [get_dzc_field dzdo_runas ]
+            set pri         [get_dzc_field pri        ]
+            set umask       [get_dzc_field umask      ]
+            set flags       [get_dzc_field flags      ]
+            set keep        [get_dzc_field keep       ]
+            set del         [get_dzc_field del        ]
+            set add         [get_dzc_field add        ]
+            set description [get_dzc_field description]
+            set newCmdName  [HZGetCommandName $dzc $source_zone]
+            select_zone $target_zone
+            new_dz_command $newCmdName     
+            set_dzc_field cmd         $cmd         
+            set_dzc_field path        $path        
+            set_dzc_field form        $form        
+            set_dzc_field dzdo_runas  $dzdo_runas  
+            set_dzc_field pri         $pri         
+            set_dzc_field umask       $umask       
+            set_dzc_field flags       $flags       
+            set_dzc_field keep        $keep         
+            set_dzc_field add         $add         
+            set_dzc_field del         $del         
+            set_dzc_field description $description 
+            save_dz_command                        
+        } errmsg]
+        if {$exceptionNo } {
+            ErrorSkip "Failed to migrate dz_command($dzc)." $errmsg
+        } else {
+            verbose "Migrate dz_command($dzc) to $target_zone."
+        }
+    }
+}
+proc commands_migrate  {source_zone target_zone} {
+    rs_commands_migrate $source_zone $target_zone
+    dz_commands_migrate $source_zone $target_zone
+}
+# Role_commands migrate
+proc role_command_migrate {source_zone target_zone} {
+    select_zone $source_zone
+    set roles [get_roles]
+    foreach role $roles {
+        #commnads--dz_commands rs_commands
+        select_zone $source_zone
+        select_role $role
+        set role_dz_commands [get_role_commands]
+        set role_rs_commands [get_role_rs_commands]
+        set role_commands [concat $role_dz_commands $role_rs_commands]
+        foreach role_command $role_commands {
+            set exceptionNo [catch {
+                set commandEnd   [string first "/" $role_command]
+                set role_command [string range $role_command 0 $commandEnd-1]
+                set newCmdName   [HZGetCommandName $role_command $source_zone]
+                HZSelectRole $role $source_zone $target_zone
+                add_command_to_role $newCmdName
+                save_role
+            } errmsg]
+            if {$exceptionNo} {
+                ErrorSkip "Failed to add command($role_command) to role($role)." $errmsg
+            } else {
+                verbose "Add command($role_command) to role($role) at $target_zone."
+            }
+        }
+    }
+}
+# Pam accesses migrate
+# two special pam access(es), * and (!*)
+# pam access name is ugly, 
+#   so we create new pam apps with the pam application of classic zone
+# it will ignore the initial space
+# Such do the role_apps migrating.
+proc pamapps_migrate  {source_zone target_zone} {
+    select_zone $source_zone
+    set pamApps [get_pam_apps]
+    foreach pamApp $pamApps {
+        select_zone $source_zone
+        select_pam_app $pamApp
+        set application [get_pam_field application]
+        set description [get_pam_field description]
+        # migrate pam_apps' application to pam_apps' name if available,
+        # otherwise convert it to <stripped name>-<objectGUID> 
+        if { $application == "*" } {
+            Warning "Application '*' will be renamed to 'login-all' in target zone."
+            continue
+        }
+        set exceptionNo [catch {
+            if { ![IsNameValid $application] } {
+                Warning "Invalid characters found in pam application, pam($application) will be renamed.\
+                Only alphanumeric, space, '-' and '_' characters are allowed in pam application in hierarchical zone."
+            }
+            set pamApp [HZGetPamName $application $pamApp $source_zone]
+            select_zone $target_zone
+            if {[catch {select_pam_app $pamApp}]} {
+                # pam apps does not exists
+                new_pam_app $pamApp
+                set_pam_field application $application
+                set_pam_field description $description
+                save_pam_app
+            } else {
+                set existing_app [get_pam_field application]
+                if { $existing_app != $application } {
+                    error "pam($pamApp) existed in target zone, while application($existing_app) is different from $application."
+                }
+            }
+        } errmsg]
+        if {$exceptionNo != 0} {
+            ErrorSkip "Failed to migrate pam($pamApp)." $errmsg
+        } else {
+            verbose "Migrate pam($pamApp) to $target_zone."
+        }
+    }
+}
+# Role_apps migrate
+# role_apps prepare for login_all_apps: 
+#     key: role using pam apps, value: 1
+set role_apps [dict create]
+proc role_apps_migrate {source_zone target_zone} {
+    global role_apps
+    select_zone $source_zone
+    set roles [get_roles]
+    foreach role $roles {
+        #pam apps
+        select_zone $source_zone
+        select_role $role
+        set role_pamApps [get_role_apps]
+        # prepare data for login_all_apps
+        if {[llength $role_pamApps] > 0} {
+            dict set role_apps $role 1
+        }
+        foreach role_pamapp $role_pamApps {
+            set exceptionNo [catch {
+                select_zone $source_zone
+                select_pam_app $role_pamapp
+                set pamApp [get_pam_field application]
+                if { $pamApp == "*" } {
+                    # No warning is given, as user is already warned in pamapps_migrate
+                    set pamApp "login-all"
+                } else {
+                    set pamApp [HZGetPamName $pamApp $role_pamapp $source_zone]
+                }
+                HZSelectRole $role $source_zone $target_zone
+                add_pamapp_to_role $pamApp
+                save_role
+            } errmsg]
+            if {$exceptionNo} {
+                ErrorSkip "Failed to add the pam($pamApp) to role($role)." $errmsg
+            } else {
+                verbose "Add pam_app($pamApp) to role($role) at $target_zone."
+            }
+        }
+    }
+}
+
+# If upn is a user, return a list containing the upn
+# if upn is a group, return a list of user in the group
+proc GetGroupMembers { upn } {
+    if { [catch {set members [get_group_members $upn]}] } {
+        return [list $upn]
+    } else {
+        return $members
+    }
+}
+
+# user_at_comp_role: dictionary
+# key: user who has computer-level role assignment, value: 1
+set user_at_comp_role [dict create]
+
+# This function will migrate all the computer-level role assignment to $target_zone
+# by precreating the computer and computer zone in the $target_zone
+proc computer_role_assignment_migrate {source_zone target_zone} {
+    global user_at_comp_role
+    global role_apps
+    set comp_assign {}
+    slz $source_zone
+    set zone_users [GetZoneUsers]
+    set target_zone_name [GetZoneName $target_zone]
+    
+    foreach zcomp [get_zone_computers] {
+        slz $source_zone
+        slzc $zcomp
+        set dnsname [gzcf dnsname]
+        set comp_zone "$dnsname@$source_zone"
+        # currently no function to get all "classic computer zone"
+        # we just try to select them, if exception occurs, it does not exist.
+        if { ![catch { slz $comp_zone }] } {
+            if { [catch {
+                foreach role_s [get_role_assignments] {
+                    slra $role_s
+                    set from [graf from]
+                    set to [graf to]
+                    lassign [split $role_s /] upn role_name
+                    set role_name [string tolower $role_name]
+                    set key [list $zcomp $dnsname]
+                    dict lappend comp_assign $key [list $role_name $upn $from $to]
+                }
+            } errmsg] } {
+                ErrorSkip "Failed to get all computer role assignments on $comp_zone" $errmsg
+            }
+        }
+    }
+    
+    dict for {key role_user_list} $comp_assign {
+        lassign $key comp_sam dnsname
+        set comp_zone "$dnsname@$target_zone"
+        slz $target_zone
+        if {[catch {precreate_computer $comp_sam -container $target_zone -czone} errmsg]} {
+            ErrorSkip "Failed to precreate computer zone($dnsname)" $errmsg
+            continue
+        } 
+        
+        set comp_zone_users [dict create]
+        set pam_users [dict create]
+        foreach role_user $role_user_list {
+            lassign $role_user role user from to
+            set role1 "[HZGetRoleName $role $source_zone]/$target_zone_name"
+            if { ![NewRoleAssignment $user $role1 $comp_zone $from $to] } { continue }
+            set user_list [GetGroupMembers $user]
+            foreach user $user_list {
+                dict set comp_zone_users $user 1
+                dict set user_at_comp_role $user 1
+                if { [dict exists $role_apps $role] } {
+                    dict set pam_users $user 1
+                }
+            }
+        }
+        
+        dict for {user -} $comp_zone_users {
+            if { [dict exists $zone_users $user] } {
+                set login [dict get $zone_users $user]
+                if { $login } {
+                    NewRoleAssignment $user "login_at_roles/$target_zone_name" $comp_zone
+
+                    if { ![dict exists $pam_users $user] } {
+                        NewRoleAssignment $user "login_all_apps/$target_zone_name" $comp_zone
+                    }
+                }
+            }
+        }
+    }
+}
+
+# Role assignments migrate
+# normal role assignment
+#   Split the role assignment {UPN/Role/Zone} to get upn and role, 
+#   then assign the role to the upn 
+# additional roles: login listed login_at_roles login_all_apps
+#   login: user who is enabled, and without any zone/computer level role assignments
+#   listed: user who is disabled and without any zone/computer level role assignments
+#   login_at_roles: user who is enabled, and with at least one zone level role assignment
+#   login_all_apps: user who is enabled, who does not have any computer level role assignments, and no pam apps roles assignment in zone
+proc role_assignments_migrate  {source_zone target_zone} {
+    slz $source_zone
+    set zone_users [GetZoneUsers]
+    computer_role_assignment_migrate $source_zone $target_zone
+    global role_apps
+    global user_at_comp_role
+    select_zone $source_zone
+    set role_assignments [get_role_assignments]
+    set pam_users [dict create]; #pam_users: dictionary(key:user who has zone-level pam apps role, value:1)
+    set role_users [dict create]; #role_users: dictionary(key:user who has zone-level role assignment, value:1)
+    foreach role_assignment $role_assignments {
+        select_zone $source_zone
+        if {[catch {slra $role_assignment} errmsg]} {
+            Warning "Select role assignment $role_assignment from source zone $source_zone: $errmsg \
+                    Please add such role assignment to hierachical zone manually."
+            continue
+        }    
+        set from [graf from]
+        set to [graf to]
+        # role assignment format UPN/Role/Zone
+        lassign [split $role_assignment /] upn role role_zone
+        set role [string tolower $role]
+        set new_role_name [HZGetRoleName $role $source_zone]
+        if { ![NewRoleAssignment $upn $new_role_name $target_zone $from $to] } { continue }
+        
+        set user_list [GetGroupMembers $upn]
+        foreach user $user_list {
+            dict set role_users $user 1
+            if { [dict exists $role_apps $role] } {
+                dict set pam_users $user 1
+            }
+        }
+    }
+
+    dict for {user login} $zone_users {
+        if {[string equal -length 1 $user "*"]} { continue }
+        
+        if { $login } {
+            if { [dict exists $role_users $user] } {
+                NewRoleAssignment $user login_at_roles $target_zone
+            }
+            
+            if { ![dict exists $user_at_comp_role $user] && ![dict exists $pam_users $user] } {
+                NewRoleAssignment $user login_all_apps $target_zone
+            }   
+        } 
+        
+        if { ![dict exists $role_users $user] && ![dict exists $user_at_comp_role $user] } {
+            if { $login } {
+                NewRoleAssignment $user "unix login" $target_zone
+            } else {
+                NewRoleAssignment $user listed $target_zone 
+            }
+        }
+        
+        if { $login == true } {
+            puts "User($user) is allowed to login although some of its alias users are disabled."
+        }
+    }
+}
+
+#privilege migrate
+# Roles migrate
+# Commands migrate
+# Role_commands migrate
+# Pam accesses migrate
+# Role_apps migrate
+# Role assignments migrate
+proc privileges_migrate {source_zone target_zone} {
+    verbose "------------ PRIVILEGES_MIGRATE: roles migrate ------------"
+    roles_migrate $source_zone $target_zone
+    verbose "----------- PRIVILEGES_MIGRATE:commands migrate -----------"
+    commands_migrate $source_zone $target_zone
+    verbose "------- PRIVILEGES_MIGRATE:role commands migrate ---------"
+    role_command_migrate $source_zone $target_zone
+    verbose "----------- PRIVILEGES_MIGRATE:pamapps migrate ------------"
+    pamapps_migrate $source_zone $target_zone
+    verbose "------- PRIVILEGES_MIGRATE:role apps     migrate ---------"
+    role_apps_migrate  $source_zone $target_zone
+    verbose "------ PRIVILEGES_MIGRATE:role_assignments migrate --------"
+    role_assignments_migrate $source_zone $target_zone
+}
+################ execute start ##########################
+### ------ options setting ------
+# admigrating item(s)
+set argCount [llength $argv]
+set verbose 0
+set nocheck 0
+set force 0
+set users 0
+set groups 0
+set nismaps 0
+set privileges 0
+set inzone ""
+set zone ""
+set hzone ""
+set bindconfig ""
+
+for {set idx 0} {$idx < $argCount} {incr idx} {
+    set flag [lindex $argv $idx]
+    switch -glob -- $flag {
+        -v {  set verbose 1      }
+        -n {  set nocheck 1      }
+        -f {  set force 1        }
+        -users {  set users 1  }
+        -groups {  set groups 1 }
+        -nismaps {  set nismaps 1 }
+        -privileges { set privileges 1 }
+        -in {
+            if {[incr idx] < $argCount} {
+                set inzone [lindex $argv $idx]
+                if { ![string equal -length 1 $inzone -] } { continue }                
+            }
+            usage "Missing -in argument"
+        }
+        -z {
+            if {[incr idx] < $argCount} {
+                set zone [lindex $argv $idx]
+                if { ![string equal -length 1 $zone -] } { continue }               
+            }
+            usage "Missing -z argument"
+        }
+        -hz {
+            if {[incr idx] < $argCount} {
+                set hzone [lindex $argv $idx]
+                if { ![string equal -length 1 $hzone -] } { continue }
+            }
+            usage "Missing -hz argument"
+        }
+        -config {
+            if {[incr idx] < $argCount} {
+                set bindconfig [lindex $argv $idx]
+                if { ![string equal -length 1 $bindconfig -] } { continue }
+            }
+            usage "Missing -config argument"
+        }            
+        default {
+            usage "Unknown option $flag"
+        }
+    }
+}
+
+if { $inzone == "" } {
+    usage "Missing input zone"
+} elseif { $zone == "" } {
+    usage "Missing output zone"
+} elseif { $bindconfig == "" } {
+    usage "Missing bind domains config file"
+}
+
+if {$users == 0 && $groups == 0 && $nismaps == 0 && $privileges == 0} {
+    # all are zeros, means migrate all.
+    lassign {1 1 1 1} users groups nismaps privileges
+}
+
+# Used for error and warning reporting at the end
+set Messages [dict create]
+set NoOfWarnings 0
+set NoOfErrors 0
+# reserved role names
+set role_reserved [dict create listed 1 "unix login" 1 login_at_roles 1 login_all_apps 1]
+
+if {[string match -nocase $inzone $zone]} {
+    ErrorExit "The input zone and output zone are identical!"
+}
+
+### ------ param ------
+# zone's domains are all bind 
+source $bindconfig
+# inzone is readable and existence. zone type is classic
+if {[catch {select_zone $inzone}]} {
+    usage "Inzone($inzone) does not exist"
+} else {
+    catch {set ztype [get_zone_field type]}
+    if {[string match "classic*" $ztype] != 1} {
+       usage "Inzone($inzone) must be a classic version 3 or classic version 4 zone"
+    }
+	
+}
+#The hzone must be tree zone if specify
+if {$hzone != ""} {
+    if {[catch {select_zone $hzone}]} { 
+        usage "Parent zone($hzone) does not exist" 
+    }
+    set ztype [get_zone_field type]
+    if {[string equal "tree" $ztype] != 1} {
+        usage "Parent zone($hzone) must be a hierarchical zone" 
+    }
+    if {[string equal -nocase $hzone $zone] == 1} {
+        usage "Parent zone($hzone) must not be the same as zone"
+    }
+}
+
+if {$verbose} { show bind }
+
+# check whether DZ is enabled
+select_zone $inzone
+catch get_roles roles 
+if {$roles != "DZ not enabled for this zone"} {
+    set dz_enabled true
+} else {
+    set dz_enabled false
+}
+
+# preview check who only use privilege items check
+if { $nocheck == 0 && $privileges == 1 && $dz_enabled } { 
+    checkDZ $inzone
+}
+
+# create target zone. set the hzone as its parent if existence 
+create_target_zone $zone $hzone $force
+zone_migrate $inzone $zone
+### ------ migrate ------
+if { $users == 1 } { 
+    verbose "USERS_MIGRATE  FROM $inzone TO $zone" 
+    if {$hzone != ""} {
+        verbose "$hzone AS PARENT" 
+        # Can't create zone user from different domain if zone schema is sfu
+        select_zone $hzone 
+        set zone_schema [get_zone_field schema]
+        if {[string equal -nocase $zone_schema "sfu"] != 1} {
+            users_migrate $inzone $zone $hzone
+        } else {
+            users_migrate $inzone $zone ""
+        }
+    } else {
+        users_migrate $inzone $zone $hzone
+    }
+}
+if {$groups     == 1 } { 
+    verbose "GROUPS_MIGRATE FROM $inzone TO $zone" 
+    groups_migrate $inzone $zone
+}
+if {$nismaps    == 1 } { 
+    verbose "NISMAPS_MIGRATE FROM $inzone TO $zone" 
+    nismaps_migrate $inzone $zone
+}
+
+if {$privileges == 1 } {
+    if { !$dz_enabled } {
+        verbose "DZ data is disable at source zone. The privileges will not be migrated"
+    } else {        
+        verbose "PRIVILEGES_MIGRATE FROM $inzone TO $zone" 
+        privileges_migrate $inzone $zone
+    }
+}
+
+if { [dict size $Messages] == 0 } {
+    puts "The migration completed successfully."    
+} else {
+    puts "There are total of $NoOfWarnings warnings and $NoOfErrors errors found during migration."
+    if { $verbose } {
+        dict for {msg -} $Messages {
+            puts $msg
+        }
+    }
+}
+
+################ execute end ##########################

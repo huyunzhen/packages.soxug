@@ -1,0 +1,106 @@
+#!/bin/sh
+RPM_INSTALL_PREFIX=
+export RPM_INSTALL_PREFIX
+# summary of how this script can be called:
+#        * <postrm> `remove'
+#        * <postrm> `purge'
+#        * <old-postrm> `upgrade' <new-version>
+#        * <new-postrm> `failed-upgrade' <old-version>
+#        * <new-postrm> `abort-install'
+#        * <new-postrm> `abort-install' <old-version>
+#        * <new-postrm> `abort-upgrade' <old-version>
+#        * <disappearer's-postrm> `disappear' <overwriter>
+#          <overwriter-version>
+# for details, see http://www.debian.org/doc/debian-policy/ or
+# the debian-policy package
+# action plan:
+#        * <postrm> `remove'
+#          - remove
+#        * <postrm> `purge'
+#          - purge
+#        * <old-postrm> `upgrade' <new-version>
+#          - skip
+#        * <new-postrm> `failed-upgrade' <old-version>
+#          - (not involved) do nothing
+#        * <new-postrm> `abort-install'
+#          - (rewind our 'preinst install', known state) remove
+#        * <new-postrm> `abort-install' <old-version>
+#          - (rewind our 'preinst install', unknown state) do nothing
+#        * <new-postrm> `abort-upgrade' <old-version>
+#          - (rewind our 'preinst upgrade', unknown state) do nothing
+#        * <disappearer's-postrm> `disappear' <overwriter>
+#          <overwriter-version>
+#          - (don't care) do nothing
+
+LOG_FILE=/var/log/centrifydc-install.log
+echo post-uninstall: 5.1.3-482: `date` >> ${LOG_FILE}
+echo "arguments:" "$@" >> ${LOG_FILE}
+
+if [ "$1" = "upgrade" ]; then
+    # Skip
+
+    echo skipping on upgrade ... >> ${LOG_FILE}
+fi
+
+if [ "$1" = "remove" ] || \
+    [ "$1" = "abort-install" -a -z "$2" ]; then
+    # Remove
+
+    ### Remove all unmanaged files
+
+    if [ -d /var/centrify ]; then rm -Rf /var/centrify >> ${LOG_FILE}; fi
+    if [ -d /var/centrifydc ]; then rm -Rf /var/centrifydc >> ${LOG_FILE}; fi
+
+    if [ -f /etc/pam.d/system-auth.pre_cdc ]; then
+        mv /etc/pam.d/system-auth /etc/pam.d/system-auth.cdc >> ${LOG_FILE}
+        mv /etc/pam.d/system-auth.pre_cdc /etc/pam.d/system-auth >> ${LOG_FILE}
+    fi
+
+    # remove upstart service files
+    rm -f /etc/init/centrifydc.conf >> ${LOG_FILE} 2>&1
+    rm -f /etc/init/centrifydc.conf.disable >> ${LOG_FILE} 2>&1
+    rm -f /etc/init/centrify-kcm.conf >> ${LOG_FILE} 2>&1
+    rm -f /etc/init/centrify-kcm.conf.disable >> ${LOG_FILE} 2>&1
+
+    #remove the Centrifydc debug from syslog-ng.conf
+    SYSLOGNG_CONF="";
+    if [ -s "/etc/syslog-ng/syslog-ng.conf" ] ; then
+        SYSLOGNG_CONF="/etc/syslog-ng/syslog-ng.conf"
+    elif [ -f "/usr/local/etc/syslog-ng/syslog-ng.conf" ] ; then
+        SYSLOGNG_CONF="/usr/local/etc/syslog-ng/syslog-ng.conf"
+    fi
+    if [ "X${SYSLOGNG_CONF}" != "X" ]; then
+        echo "Checking $SYSLOGNG_CONF for centrifydc.log" >> ${LOG_FILE}
+        cat $SYSLOGNG_CONF | grep /var/log/centrifydc.log  | grep "^destination centrify" >> ${LOG_FILE} 2>> ${LOG_FILE}
+        if [ "$?" = "0" ]; then
+            echo Deleting centrifydc.log from $SYSLOGNG_CONF >> ${LOG_FILE}
+            cp -p $SYSLOGNG_CONF ${SYSLOGNG_CONF}.pre_cdc_uninstall >> ${LOG_FILE} 2>> ${LOG_FILE}
+            sed -e "/\/var\/log\/centrifydc.log/d" -e "/f_centrify/d" $SYSLOGNG_CONF > ${SYSLOGNG_CONF}.tmp_uninstall
+            mv -f ${SYSLOGNG_CONF}.tmp_uninstall ${SYSLOGNG_CONF} >> ${LOG_FILE} 2>> ${LOG_FILE}
+        fi
+    fi
+fi
+
+if [ "$1" = "purge" ]; then
+    # Purge
+
+    ### Purge configurations
+
+    rm -Rf /etc/centrifydc/*
+
+    # remove samba init script
+    if [ -f /etc/init.d/centrifydc-samba ]; then
+        update-rc.d -f centrifydc-samba remove >> ${LOG_FILE} 2>> ${LOG_FILE}
+        rm -f /etc/init.d/centrifydc-samba >> ${LOG_FILE} 2>> ${LOG_FILE}
+    fi
+
+    if [ -f /etc/init.d/centrifydc ]; then
+        update-rc.d -f centrifydc remove > /dev/null 2> /dev/null
+    fi
+
+    if [ -f /etc/init.d/centrify-kcm ]; then
+        update-rc.d -f centrify-kcm remove > /dev/null 2> /dev/null
+    fi
+fi
+
+exit 0

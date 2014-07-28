@@ -1,0 +1,262 @@
+#!/bin/bash
+#
+# centrifydc
+#
+# Platform independent startup script for the Centrify AD infrastructure.  
+#
+# Description:  Centrify AD interface support
+#
+# Copyright (C) 2005 Centrify Corp.
+# All rights reserved.
+#
+
+NAME="Centrify DirectControl"
+USAGE="usage: $0 {start|stop|leave|restart|condrestart|flush|status} [options]"
+
+# Source CDC function library.
+. /usr/share/centrifydc/scripts/functions.start
+
+on_leave()
+{
+    if [ "$RUNNING" -ne "1" ]; then
+        $ECHO "${NAME} is not running."
+    else
+        if [ "$UID" -eq "0" ]; then
+            if [ "$TARGET_OS" = "aix" ]; then
+                stop_and_wait
+            elif [ "$TARGET_OS" = "darwin" ] ; then
+                # when we leave we need to disable adclient from launchctl forever
+                $DISABLE_CMD $CMD_OPTIONS > /dev/null 2>&1
+                kill_process ${PROG}
+            elif [ "$TARGET_OS" = "solaris" ] ; then
+                $DISABLE_CMD $CMD_OPTIONS > /dev/null 2>&1
+            else
+                $STOP_CMD $CMD_OPTIONS > /dev/null 2>&1
+            fi
+            RETVAL=$?
+            if [ $RETVAL -eq 0 ]; then
+                $ECHO "${NAME} stopped."
+            else
+                $ECHO "Fail to stop ${NAME}."
+            fi
+        else
+            $ECHO "Root privilege is required to stop ${NAME}."
+            RETVAL=1
+        fi
+    fi
+    if [ $RETVAL -eq 0 ]; then
+        # Source adnisd function library, if it is installed
+        if [ -f /etc/centrifydc/scripts/functions.adnisd ]; then
+            . /etc/centrifydc/scripts/functions.adnisd
+            # stop it if adnisd is running
+            adnisd_status > /dev/null 2>&1
+            if [ $? -eq 0 ]; then
+                if [ "$UID" -eq "0" ]; then
+                    adnisd_stop > /dev/null 2>&1
+                    RETVAL=$?
+                    if [ $RETVAL -eq 0 ]; then
+                        $ECHO "${NIS_NAME} stopped."
+                    else
+                        $ECHO "Fail to stop ${NIS_NAME}."
+                    fi
+                else
+                    $ECHO "Root privilege is required to stop ${NIS_NAME}."
+                    RETVAL=1
+                fi
+            fi
+        fi
+    fi
+
+    if [ "$TARGET_OS" = "darwin" ]; then    
+        # Lets restart the directory service when we leave the domain to handle potential
+        # hangups with adclient.
+        /usr/share/centrifydc/bin/dsconfig restart 
+    fi
+}
+
+#
+# A svcadm 'wrapper' functions to workaround a bug in svcadm on
+# Solaris 11 Express.
+#
+# When 'svcadm disable' is run with the '-s' option and the
+# service cannot stop within the timeout period, it does not
+# return until someone clear the maintenance state to disable.
+#
+# So, we no longer use '-s' for svcadm, we have to run svcadm
+# and wait until the service state is changed. This wrapper is
+# simulating the '-s' behavior.
+#
+svcadm_wait() {
+    SWAIT_RC=0
+    case "$1" in
+        enable|disable)
+            SWAIT_TASK="$1"
+            shift
+            SWAIT_OPTS=""
+            if [ "$SWAIT_TASK" = "enable" ]; then
+                SWAIT_TARGET_STATE="online"
+            else
+                # disable
+                SWAIT_TARGET_STATE="disabled"
+            fi
+            # Possible stable states (see smf(5))
+            SWAIT_END_STATES="maintenance degraded $SWAIT_TARGET_STATE"
+            case "$1" in
+                -*)
+                    SWAIT_OPTS="$1"
+                    shift
+                    ;;
+            esac
+            # Currently we only accept 1 service
+            if [ $# -ne 1 ]; then
+                SWAIT_RC=2
+            else
+                SWAIT_SERVICE="$1"
+                SWAIT_INIT_STATE=`svcadm_get_state $SWAIT_SERVICE`
+
+                # Whether 'maintenance' state will affect the
+                # task is still unknown. Sometimes we can 'enable'
+                # the service to 'online' and clear the 'maintenance'
+                # state, sometimes we cannot.
+                #
+                # For our use cases, we don't really care about
+                # the 'maintenance' state. Just clear it to ensure
+                # the task can be done.
+                #
+                if [ "$SWAIT_INIT_STATE" = "maintenance" ]; then
+                    /usr/sbin/svcadm clear $SWAIT_SERVICE
+                fi
+                SWAIT_INIT_STATE=`svcadm_get_state $SWAIT_SERVICE`
+
+                /usr/sbin/svcadm $SWAIT_TASK $SWAIT_OPTS $SWAIT_SERVICE
+                SWAIT_RC=$?
+
+                if [ "$SWAIT_RC" -eq 0 -a \
+                    "$SWAIT_TARGET_STATE" != "$SWAIT_INIT_STATE" ]; then
+
+                    SWAIT_STATE=`svcadm_get_state $SWAIT_SERVICE`
+                    while echo "$SWAIT_END_STATES" | \
+                        grep -vw "$SWAIT_STATE" > /dev/null ; do
+                        sleep 1
+                        SWAIT_STATE=`svcadm_get_state $SWAIT_SERVICE`
+                    done
+
+                    # Check final state
+                    if [ "$SWAIT_STATE" = "maintenance" ]; then
+                        # Problem occurred, assume this is a problem with
+                        # the service instance itself.
+                        echo "svcadm: Instance \"`svcadm_get_fmri $SWAIT_SERVICE`\" is in maintenance state." >&2
+                        SWAIT_RC=3
+                    fi
+                fi
+            fi
+            ;;
+        *)
+            # Unknown task, by-pass this function
+            /usr/sbin/svcadm "$@"
+            SWAIT_RC=$?
+            ;;
+    esac
+
+    return $SWAIT_RC
+}
+
+#
+# Get service current state.
+#
+svcadm_get_state()
+{
+    # Get nstate as well to avoid getting the '*' in state,
+    # use awk to get the state only
+    /usr/bin/svcs -H -o state,nstate $1 | awk '{ print $1 }'
+}
+
+#
+# Get service FMRI.
+#
+svcadm_get_fmri()
+{
+    /usr/bin/svcs -H -o fmri $1
+}
+
+
+# Execute command
+#################
+
+identify_operating_system
+prepare_cmds
+get_uid
+
+CMD=$1
+[ $# -gt 0 ] && shift
+RETVAL=0
+JOINED=1
+RUNNING=0
+
+$INFO_CMD --name > /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    JOINED=0
+    case "$CMD" in
+        #dummy)
+        start|restart|condrestart|flush)
+            $ECHO "This machine has not joined to any domain."
+            exit 1
+            ;;
+        *)
+            ;;
+    esac
+fi
+
+get_pids "$STATUS_CMD"
+[ -n "$PIDS" ] && RUNNING=1
+
+CMD_OPTIONS=""
+if [ "$PASS_OPTIONS" -eq 1 ]; then
+    CMD_OPTIONS="$@"
+fi
+case "$CMD" in
+    start)
+        start_service
+        ;;
+    stop)
+        stop_service
+        ;;
+    leave)
+        on_leave
+        ;;
+    restart)
+        restart_service
+        ;;
+    condrestart)
+        condrestart_service
+        ;;
+    flush)
+        if [ "$RUNNING" -ne "1" ]; then
+            $ECHO "${NAME} is not running."
+        else
+            if [ "$UID" -eq "0" ]; then
+                $FLUSH_CMD "$@" > /dev/null 2>&1
+                RETVAL=$?
+                if [ $RETVAL -eq 0 ]; then
+                    $ECHO "${NAME} cache flushed."
+                else
+                    $ECHO "Fail to flush ${NAME} cache."
+                fi
+            else
+                $ECHO "Root privilege is required to flush ${NAME} cache."
+                RETVAL=1
+            fi
+        fi
+        ;;
+    status)
+        status_service
+        $INFO_CMD "$@"
+        
+        ;;
+    *)
+        $ECHO $USAGE;
+        exit 1
+        ;;
+esac
+
+exit $RETVAL

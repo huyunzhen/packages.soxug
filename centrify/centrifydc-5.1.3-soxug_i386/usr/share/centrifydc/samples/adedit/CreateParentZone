@@ -1,0 +1,60 @@
+#!/bin/env adedit
+
+# This script creates a tree zone. Use this, for example, to create the
+# parent zone for child zones created in other scripts
+#
+
+package require ade_lib
+
+proc usage {msg} {
+	puts {usage: -z <parentZone> -u <user>}
+	
+	puts $msg
+	exit 1
+}
+
+if {[getopt argv -z parentZone] == 0} {
+	usage "Missing the name for the new zone"
+}
+
+puts "
+Enter the domain name for the bind command"
+gets stdin domain
+
+if {[getopt argv -u user] != 0} {
+
+	if {[getopt argv -p password]} {
+		bind $domain $user $password
+
+		} else {
+		bind $domain $user} 
+	} else {
+	puts "Enter administrator name"
+	gets stdin user
+	bind $domain $user
+}
+
+set domaindn [dn_from_domain $domain]
+
+puts "
+Enter the name of the Active Directory container that holds the Centrify zone data"
+gets stdin zonesNode
+
+puts "
+Enter the organizational unit with the Centrify zone data container"
+gets stdin baseOU
+
+puts "Summary:"
+puts "	Domain is $domain. DN for the domain is $domaindn"
+puts "	The base OU is $baseOU."
+puts "	The container for the zone information is $zonesNode"
+puts "	The new zone is named $parentZone"
+
+#create the parent zone in Active Directory
+puts "
+Creating Centrify zone $parentZone"
+
+create_zone tree "cn=$parentZone,cn=$zonesNode,ou=$baseOU,$domaindn" std
+
+puts "Created new zone: cn=$parentZone,cn=$zonesNode,ou=$baseOU,$domaindn"
+

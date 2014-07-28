@@ -1,0 +1,78 @@
+#!/bin/env adedit
+
+# This script creates 2 child zones in the domain and parent zone 
+# specified in the command line
+#
+
+package require ade_lib
+
+proc usage {msg} {
+	puts {usage: -d <domain> -z <parentZone> [-u <user>] [-p <password>]}
+	
+puts $msg
+	exit 1
+}
+
+if {[getopt argv -d domain] == 0} {
+	usage "Missing Domain, ex. demo.test"
+}
+
+if {[getopt argv -z parentZone] == 0} {
+	usage "Missing parent zone, ex. HQ"
+}
+
+if {[getopt argv -u user] != 0} {
+
+	if {[getopt argv -p password]} {
+		bind $domain $user $password
+
+		} else {
+        bind $domain $user} 
+	} else {
+    puts "Enter administrator name"
+	gets stdin user
+	bind $domain $user
+}
+puts "
+Enter the name of the container for the Centrify zone data"
+gets stdin zoneContainer
+
+
+puts "
+Enter the organizational unit for the Centrify zone data"
+gets stdin zoneContainerOU
+
+# Define distinguished name for domain
+set domaindn [dn_from_domain $domain]
+puts "
+Summary:"
+puts "	Domain is $domain. DN for the domain is $domaindn"
+puts "	The base OU is $zoneContainerOU."
+puts "	The container for the zone information is $zoneContainer
+"
+
+# Create child zones
+
+puts "Enter child zone name"
+gets stdin czone1
+
+puts "
+Enter another child zone name"
+gets stdin czone2
+
+create_zone tree "cn=$czone1,cn=$parentZone,cn=$zoneContainer,ou=$zoneContainerOU,$domaindn" std
+create_zone tree "cn=$czone2,cn=$parentZone,cn=$zoneContainer,ou=$zoneContainerOU,$domaindn" std
+
+# link the children to parent
+select_zone "cn=$czone1,cn=$parentZone,cn=$zoneContainer,ou=$zoneContainerOU,$domaindn"
+set_zone_field parent "cn=$parentZone,cn=$zoneContainer,ou=$zoneContainerOU,$domaindn"
+save_zone
+select_zone  "cn=$czone2,cn=$parentZone,cn=$zoneContainer,ou=$zoneContainerOU,$domaindn"
+set_zone_field parent "cn=$parentZone,cn=$zoneContainer,ou=$zoneContainerOU,$domaindn"
+save_zone
+
+puts "
+Child zones $czone1 and $czone2 created in $parentZone"
+
+
+

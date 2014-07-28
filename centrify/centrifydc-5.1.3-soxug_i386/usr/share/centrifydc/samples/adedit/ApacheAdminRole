@@ -1,0 +1,99 @@
+#!/bin/env adedit
+
+puts "This script creates privileged commands and the ApacheAdminRole in the zone entered"
+
+package require ade_lib
+
+puts "
+Enter the domain name"
+gets stdin domain
+
+puts "
+Enter the account name to use to modify Active Directory"
+gets stdin acctName
+
+bind $domain $acctName
+
+set domaindn [dn_from_domain $domain]
+
+set zonelist [get_zones $domain]
+set numberZones [llength $zonelist]
+
+set row 1
+set zonenum 0
+
+puts "
+This domain contains the following zones"
+while {$numberZones != 0} {
+	puts "$row. [lindex $zonelist $zonenum]"
+	incr zonenum
+	incr row
+	incr numberZones -1
+}
+
+puts "
+Enter the row number of the target zone"
+gets stdin rowSelect
+
+set zone [lindex $zonelist [incr rowSelect -1]]
+
+select_zone "$zone"
+
+puts "
+Creating command-level Apache admin rights in $zone"
+
+
+puts "
+Creating web_edit_httpd_config"
+new_dz_command web_edit_httpd_config
+set_dzc_field cmd "vi /etc/httpd/conf/*"
+set_dzc_field description "edit httpd config file"
+set_dzc_field dzdo_runas root
+set_dzc_field dzsh_runas root
+set_dzc_field path /usr/local/apache2/bin
+save_dz_command
+
+puts "
+Creating web_apachectl"
+new_dz_command web_apachectl
+set_dzc_field cmd "apachectl *"
+set_dzc_field description "Web Apache Server Control"
+set_dzc_field dzdo_runas root
+set_dzc_field dzsh_runas root
+set_dzc_field path /usr/local/apache2/bin
+save_dz_command
+
+puts "
+Creating web_htpasswd"
+new_dz_command web_htpasswd
+set_dzc_field cmd "htpasswd *"
+set_dzc_field description "Web Apache Manage user files"
+set_dzc_field dzdo_runas root
+set_dzc_field dzsh_runas root
+set_dzc_field path /usr/local/apache2/bin
+save_dz_command
+
+#--------------------------------------------------------------------
+# Create ApachedAdminRights role
+
+# The new_role command creates the role in the currently selected zone.
+
+puts "
+Creating the ApacheAdminRole with these rights" 
+
+# In each role you need to set the sysrights with the set_role_field 
+# to the following binary values
+# password_login = 01
+# sso = 02
+# ignore_disabled = 04
+# full_shell = 08
+
+new_role ApacheAdminRights
+add_command_to_role web_edit_httpd_config
+add_command_to_role web_apachectl
+add_command_to_role web_htpasswd
+set_role_field sysrights [expr 0x0000000b] #full_shell | sso | password_login
+save_role
+
+save_zone
+

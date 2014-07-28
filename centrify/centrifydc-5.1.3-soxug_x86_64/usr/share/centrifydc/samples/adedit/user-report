@@ -1,0 +1,44 @@
+#!/bin/env adedit
+
+# This script lists the users in the zone you specify
+# in the command line. 
+
+# On the command line use either -m or -u 
+
+package require ade_lib
+
+proc usage {msg} {
+	puts {usage: -z <zoneDN> [-m] [-u <user>] [-p <password>]}
+	puts $msg
+	exit 1
+}
+if {[getopt argv -z zoneDN] == 0} {
+	usage "Missing input zone. Enter full distinguished name"
+}
+if {[catch {domain_from_dn $zoneDN} domain]} {
+	usage "Invalid input zone name. Enter full distinguished name"
+}
+set verbose 0
+if {[getopt argv -v]} {
+	set verbose 1
+}
+
+if {[getopt argv -m]} {
+	bind -machine $domain 
+} else { 
+   if {[getopt argv -u user]} {
+      if {[getopt argv -p password]} {
+	bind $domain $user $password
+       } else {
+        bind $domain $user} 
+	} else {
+    bind $domain
+  }
+}
+
+select_zone $zoneDN
+list_zone_users
+	  
+
+	
+

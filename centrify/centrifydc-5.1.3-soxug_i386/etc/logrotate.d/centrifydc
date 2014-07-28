@@ -1,0 +1,10 @@
+/var/log/centrifydc.log /var/log/centrify_client.log /var/log/centrify_mapper_error.log {
+    compress
+    missingok
+    rotate=5
+    size=500k
+    sharedscripts
+    postrotate
+	/bin/kill -HUP `cat /var/run/syslogd.pid 2> /dev/null` 2> /dev/null || true
+    endscript
+}

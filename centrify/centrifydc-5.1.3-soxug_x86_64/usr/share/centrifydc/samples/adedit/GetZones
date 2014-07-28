@@ -1,0 +1,24 @@
+#!/bin/env adedit
+
+# GetZones
+# Purpose: Performs a recursive listing of all Centrify zones in the specified domain
+#
+
+package require ade_lib
+
+source setenv
+
+puts "
+This script retrieves a recursive listing of all Centrify zones in the $domain domain"
+
+puts "
+The Active Directory folder with the Centrify zone data is named $zonesContainer"
+puts "
+That container is in organizational unit $zonesContainerOU"
+puts "
+The parent zone is $parentZone"
+
+foreach ZONE [get_zones $domain] {
+	puts $ZONE;
+}
+

@@ -1,0 +1,771 @@
+#!/bin/sh /usr/share/centrifydc/perl/run
+#
+# Run the Group Policy mapper scripts to convert registry settings
+# to the appropriate OS and application configuration.
+#
+# This is intended to be run from other programs, so error logging
+# is via syslog.
+#
+# Parameters: <machine|user> <map|unmap> <username|machinename> <mode>
+#   map|unmap            action
+#   machine|user         machine class or user class
+#   username|machinename the user or machine  to map.  Use "*" to iterate over 
+#                        all users in the registry.  
+#   mode                 boot, login, refresh or force
+#
+# Exit value:
+#   0   Normal
+#   1   Error
+#   2   Usage
+#
+use strict;
+use lib '/usr/share/centrifydc/perl';
+
+use POSIX;
+use File::Basename;
+use CentrifyDC::Config;
+use CentrifyDC::Logger;
+use CentrifyDC::GP::Registry;
+use Fcntl qw(:flock);
+
+my $REG_KEY = "Software/Policies/Centrify/CentrifyDC/Settings/GP";
+my $CENTRIFYDC_MAPPER = "centrifydc.conf.pl";
+my $HOST_FILE = "/var/centrifydc/kset.host";
+
+my $logger;
+
+#
+# How long to wait for a mapper to run, and how long to wait after
+# sending it a signal.
+#
+my $MAPPER_TIMEOUT      = 30;
+my $KILL_TIMEOUT        = 2;
+
+#
+# The name of the lock file.
+#
+my $LOCKFILE            = ".lock";
+
+#
+# The record of which mappers were run.
+#
+my %mappers_run;
+
+#
+# The dependency list is a hash of arraies.
+#
+# The hash key is the mapper script whereas the hash value is an array of 
+# mapper scripts that the key mapper script depends on.
+#
+#   e.g. If mapper script certgp_mac.pl depends on mapper scripts certgp.pl and
+#        certgp_dummy.pl to run first and exit scessfully.
+#   {
+#       certgp_mac.pl => [ certgp.pl, certgp_dummy.pl ]
+#   }       
+#   
+# runmappers will run key mapper script after all other mapper scripts have ran
+# if there are failed dependencies. E.g. mac_mapper_network.pl relies on
+# mac_mapper_wifi_profile.pl so runmappers will run the former after the latter
+# even if mac_mapper_network.pl comes alphabetically after
+# mac_mapper_wifi_profile.pl
+my %DEPENDENCY_LIST =
+(
+    "certgp_mac.pl" => [ "certgp.pl" ],
+    "mac_mapper_network.pl" => [ "mac_mapper_wifi_profile.pl" ],
+);
+
+my $zzreload = "zzreload.pl";
+
+(my $PROGRAM_NAME = $0) =~ s/.*(?=\/)\/?([^\/]*)$/$1/;
+#
+# Set the debug bit
+#
+my $DEBUG = $CentrifyDC::Config::properties{'log'};
+
+if (!defined($DEBUG))
+{
+    $DEBUG = "INFO";
+}
+
+sub usage()
+{
+    print(STDERR "Usage: $PROGRAM_NAME <machine|user> <map|unmap> <username|machinename> <boot|login|refresh|force>\n");
+    exit(2);
+}
+#
+# For debugging. 
+#
+sub FFDEBUG($)
+{
+    my ($msg) = @_;
+    return unless ($DEBUG eq 'DEBUG');
+    logger->log('debug', $msg);
+}
+
+#
+# May only be run by root.
+#
+sub check_uid()
+{
+    if ($> ne 0) {
+        print STDERR "Error: $PROGRAM_NAME may only be run by root.\n";
+        exit(1);
+    }
+}
+#
+# Parse the list of mappers to run, in the proper order.  This is
+# a little tricky because we want to allow for a list like:
+#
+# gp.mappers.machine: first_mapper * !disabled_mapper last_mapper
+#
+# Which will run first_mapper, then any other mappers in the
+# directory except last_mapper and disabled_mapper, then
+# last_mapper.  Since the * will match first_mapper,
+# disabled_mapper, and last_mapper, we have to remove them from
+# the mapper list as we build it.
+#
+# Filenames and wildcards can also be used with exclamation marks
+# to remove all files that match from the list.
+#
+# More formally, the rules for wildcards are:
+#
+# 1.  Expand the wildcard, building the list of all the files
+#     in the directory that match it.
+#
+# 2.  Remove any files that are explicitly listed, either
+#     before or after the wildcard.
+#
+# If the wildcard begins with an exclamation point:
+#
+# 3.  Remove the remaining matches from the list of mappers that
+#     has been built thus far.
+#
+# Otherwise (the wildcard does not begin with an exclamation point):
+#
+# 3.  Remove any files that are already in the list of mappers
+#     that has been built thus far.  Wildcards only add files
+#     that were not added to the list by a previous wildcard.
+#
+# 4.  Add the remaining matches to the end of the list of mappers
+#     to run.
+#
+# Mappers can also be excluded by turning off the execute bit
+# with chmod(1).
+#
+sub parse_patterns($$)
+{
+    my ($patterns, $class) = @_;
+    my @mappers;
+
+    my @patterns = split(/\s+/, $patterns);
+
+    if ($patterns !~ /(^[^!]|.*\s[^!]).*/)
+    {
+    #
+    # The list consists of nothing but negated patterns.
+    # Add "*" to the beginning of the pattern list so there
+    # is something to negate.
+    #
+        unshift(@patterns, "*");
+    }
+
+    if ($class eq "machine")
+    {
+    #
+    # Always run our mapper.  This can be overridden by putting
+    # "!centrifydc.conf.pl" explictly on the list, but it will
+    # not be removed by any wildcard match such as "!*.pl".
+    #
+        unshift(@patterns, $CENTRIFYDC_MAPPER);
+    }
+
+    foreach my $pattern (@patterns)
+    {
+        my $disabled = 0;
+        my @matches;
+
+        if ($pattern =~ /^!/)
+        {
+            $disabled = 1;
+            $pattern =~ s/^!//;
+        }
+
+        if ($pattern !~ /[\*\?\[\]\\\/\(\)\^\|\+\$]/)
+        {
+            @matches = ($pattern);
+        }
+        else
+        {
+            #
+            # Expand the wildcard, then remove any filename that
+            # appears explicitly elsewhere in the list from the
+            # config file, either before or after the wildcard.
+            #
+            # Check each matching filename, and add it to the list if
+            # it's not listed explicitly somewhere else, and didn't
+            # match a previous wildcard.
+            #
+            # This looks like a lot of work, but the most common
+            # configuration will just be "*", in which case it
+            # will only run once, and the inner greps will have
+            # very little work to do.
+            #
+            @matches = grep {
+                my $test = $_;
+                $test =~ s/([\*\?\[\]\\\/\(\)\^\|\+\$])/\\$1/g;
+                ! grep(/^\!?$test$/, @patterns) &&
+                    ($disabled || ! grep(/^$test$/, @mappers));
+            } glob($pattern);
+        }
+
+        if ($disabled)
+        {
+            #
+            # Remove the disabled mappers from the list.
+            #
+            @mappers = grep {
+                my $mapper = $_;
+
+                ! grep(/^$mapper$/, @matches);
+            } @mappers;
+        }
+        else
+        {
+            # Add the mappers that matched and are executable.
+            @mappers = (@mappers, grep(-x $_, @matches));
+        }
+    }
+
+    return @mappers;
+}
+
+#
+# Wait for the specified number of seconds for a child process to finish.
+#
+sub timed_wait ($$)
+{
+    my ($timeout, $pid) = @_;
+
+    eval {
+        local $SIG{ALRM} = sub { die "alarm\n" };
+        alarm $MAPPER_TIMEOUT;
+        waitpid($pid, 0);
+        alarm 0;
+    };
+
+    if ($@)
+    {
+        die unless ($@ eq "alarm\n");
+    }
+
+    return $@;
+}
+
+#
+# Run a command and wait for it to finish.
+#
+sub run ($@)
+{
+    my $program = $_[0];
+    my $pid = fork();
+
+    if (! defined($pid))
+    {
+        die "Cannot fork: $!";
+    }
+
+    if ($pid)
+    {
+        my $error = timed_wait($MAPPER_TIMEOUT, $pid);
+
+        if ($error)
+        {
+            $logger->log('error', "$_[0] taking too long, killing");
+            kill(SIGTERM, $pid);
+
+            $error = timed_wait($KILL_TIMEOUT, $pid);
+        }
+
+        if ($error)
+        {
+            $logger->log('error',
+        "$_[0] is not responding to SIGTERM, sending SIGKILL");
+            kill(SIGKILL, $pid);
+
+            $error = timed_wait($KILL_TIMEOUT, $pid);
+        }
+
+        if ($error)
+        {
+            $logger->log('error', "$_[0] is not responding to SIGKILL");
+            $? = -1;
+        }
+    }
+    else
+    {
+        exec({ $program } @_) || die "Cannot execute $program $!";
+    }
+
+    my $rc = $?;
+
+    #
+    # Log the exit status or signal.
+    #
+    if (WIFSIGNALED($rc))
+    {
+        $logger->log('error', join(" ", @_) . ": Terminated by signal %d",
+        WTERMSIG($rc));
+    }
+    else
+    {
+        #
+        # Command should exit with 0 if run successfully.
+        # If exit value is not 0, something may gone wrong.
+        #
+        if ($rc == 0)
+        {
+            $logger->log('debug', join(" ", @_) . ": Exit status %d",
+                WEXITSTATUS($rc));
+        }
+        else
+        {
+            $logger->log('info', join(" ", @_) . ": Exit status %d. A problem may have occurred.",
+                WEXITSTATUS($rc));
+        }
+    }
+
+    $mappers_run{$program} = $rc;
+}
+
+
+#
+# Check the dependency of a program, return undef if the dependency 
+# requirement is not fulfilled.
+#
+#   $_[0]:  directory which contain the program
+#   $_[1]:  program name
+#
+#   return: 1       - successful
+#           undef   - failed
+#
+sub check_dependencies($$)
+{
+    my ($dir, $program_name) = @_;
+
+    if (!defined($program_name))
+    {
+        return undef;
+    }
+
+    if (!defined($DEPENDENCY_LIST{$program_name}))
+    {
+        return 1;
+    }
+
+    foreach my $dependency (@{$DEPENDENCY_LIST{$program_name}})
+    {
+        $logger->log('trace', "$program_name depends on $dependency");
+        
+        #
+        # Return failure if either one of the two conditions match
+        #     1. Mapper that the program depends on is not yet run
+        #     2. Mapper that the program depends on return failure or is
+        #        being killed
+        #
+        
+        my $rc = $mappers_run{"$dir/$dependency"};
+
+        if (!defined($rc))
+        {
+            $logger->log('debug', "Failed dependency found: $dependency is not run");
+            return undef;
+        }
+
+        if ($rc != 0)
+        {
+            $logger->log('debug', "Failed dependency found: $dependency failed to run");
+            return undef;
+        }
+    }
+
+    return 1;
+}
+
+#
+# Check command-line arguments.
+#
+
+usage() if (@ARGV < 4);
+
+my $class = shift(@ARGV);
+my $action = shift(@ARGV);
+my @users;
+my $mode;
+
+check_uid();
+
+usage() if ($class ne "machine" && $class ne "user");
+usage() if ($action ne "map" && $action ne "unmap");
+
+# Could be the machine name as well, though not currently used
+@users[0] = shift(@ARGV);
+
+$mode = shift(@ARGV);
+
+usage() if ($mode ne "boot" && $mode ne "login" && $mode ne "refresh" && $mode ne "force");
+
+#
+# Set up logging.
+#
+$logger = CentrifyDC::Logger->new('runmappers');
+$logger->log('debug', "Run runmappers - class:$class | action:$action | user:@users | mode:$mode");
+
+#
+# Check if machine joined to any domain.
+#
+my $is_joined_domain = 0;
+if (-e $HOST_FILE)
+{
+    if (-s $HOST_FILE > 0)
+    {
+        # Read from host file
+        my @hosts = ();
+        eval {
+            open FILE, "<$HOST_FILE";
+            flock(FILE, LOCK_EX|LOCK_NB);
+            chomp(@hosts = <FILE>);
+            flock(FILE, LOCK_UN);
+            close FILE;
+        };
+        if (! $@)
+        {
+            if (@hosts > 0)
+            {
+                $logger->log('debug', "Hostname: @hosts");
+                $is_joined_domain = 1;
+            }
+        }
+    }
+}
+
+if ($is_joined_domain == 0)
+{
+    $logger->log('error', "Machine is not joined to any domain.");
+}
+
+#
+# Get the timeout value, if set.
+#
+my $timeout = $CentrifyDC::Config::properties{"gp.mappers.timeout"};
+
+if (!defined($timeout))
+{
+    $timeout = 30
+}
+
+$MAPPER_TIMEOUT = $timeout;
+
+#
+# Look up the mappers directory in the config file.
+#
+my $mapperDir = $CentrifyDC::Config::properties{"gp.mappers.directory.$class"};
+
+if (!defined($mapperDir))
+{
+    $mapperDir = $class;
+}
+
+if ($mapperDir !~ m{^/})
+{
+    my $parent = $CentrifyDC::Config::properties{"gp.mappers.directory"};
+    if (!defined($parent))
+    {
+        $parent = "/usr/share/centrifydc/mappers";
+    }
+    $mapperDir = "$parent/$mapperDir";
+}
+
+my $regDir = $CentrifyDC::Config::properties{"gp.reg.directory.$class"};
+
+if (!defined($regDir))
+{
+    # Mildly irritating, the machine directory is called machine, but the user
+    # directory is called "users" (with the s)
+    if ($class eq "user")
+    {
+        $regDir = "/var/centrifydc/reg/users";
+    }
+    else
+    {
+        $regDir = "/var/centrifydc/reg/machine";
+    }
+}
+
+# If the registry directory doesn't exit, there are no settings to map.
+if (! chdir($regDir))
+{
+    $logger->log('debug', "No $class settings found in registry.");
+    exit(0);
+}
+
+#
+# Try to lock the directory.  If it fails, the mappers are already
+# being run, and there's no point waiting just to run them again.
+#
+my $lockfile = "$regDir/$LOCKFILE";
+open(LOCK, "> $lockfile") || die ("Cannot create $lockfile: $!");
+
+if (! flock(LOCK, LOCK_EX | LOCK_NB))
+{
+    # This should almost never happen now, since adclient is running
+    # this synchronously
+    $logger->log('info', "@users mappers are already running, exiting");
+    close(LOCK);
+    exit(EALREADY);
+}
+
+#
+# Build the valid user list. A valid user needs to have a directory in
+#   /var/centrifydc/reg/users/
+#
+if ($class eq "user")
+{
+    if ($users[0] eq '*')
+    {
+        @users = glob('*');
+    }
+    else
+    {
+        my @validusers = ();
+        foreach my $user (@users)
+        {
+            if (-d $user)
+            {
+                #  only add new entry
+                my $is_user_added = 0;
+                foreach my $validuser (@validusers)
+                {
+                    if ($validuser eq $user) {
+                        $is_user_added = 1;
+                    }
+                }
+                if ($is_user_added == 0)
+                {
+                    push @validusers, $user;
+                }
+            }
+        }
+        @users = @validusers;
+    }
+    if (@users eq 0)
+    {
+        $logger->log('debug', "No $class settings found in the registry.");
+        exit(0);
+    }
+    $logger->log('debug', "Valid user: @users");
+}
+
+# If the mappers directory doesn't exit, there are no mappers to run.
+if (! chdir($mapperDir))
+{
+    $logger->log('debug', "Mapper directory $mapperDir does not exist.");
+    exit(0);
+}
+
+#
+# Determine the list of mappers to run.  Since Group Policy can
+# be used to control the list, we must check the registry directly
+# here.  If we just rely on the value in the CentrifyDC configuration
+# file, and the mapper script that manages that configuration file
+# is removed from the list, it won't be run again to update the
+# file if it is ever added back.
+#
+my $patterns = $CentrifyDC::Config::properties{"gp.mappers.$class"};
+
+#
+# get the mapper umask. If none exist then use default 0022
+#
+my $m_mask = $CentrifyDC::Config::properties{"gp.mappers.umask"};
+if (!defined($m_mask)) {
+        $m_mask = 0022;
+}
+#
+# the mask for this process and spanwed process to the mapper mask
+#
+$m_mask = oct($m_mask) if $m_mask =~ /^0/;
+umask($m_mask);
+
+if (!defined($patterns))
+{
+    $patterns = "*";
+}
+
+CentrifyDC::GP::Registry::Load(undef);
+
+(undef, my $reg_patterns) = CentrifyDC::GP::Registry::Query("machine",
+    $REG_KEY, "current", "gp.mappers.$class");
+(undef, my $prev_patterns) = CentrifyDC::GP::Registry::Query("machine",
+    $REG_KEY, "previous", "gp.mappers.$class");
+(undef, my $local_patterns) = CentrifyDC::GP::Registry::Query("machine",
+    $REG_KEY, "local", "gp.mappers.$class");
+
+if (defined($reg_patterns))
+{
+    # There is a list defined in the registry; use it.
+    $patterns = $reg_patterns;
+}
+elsif ($patterns eq $prev_patterns)
+{
+    #
+    # The registry list has been removed, and the file currently has the
+    # previous gp-controlled value.  Use the list that was saved
+    # the last time the file was manually edited instead.
+    #
+    $patterns = $local_patterns;
+}
+# else the list has not been managed by GP recently, or the
+# GP setting has just been removed and the list in the file
+# has been hand-edited.  Either way, use the list from the file.
+
+my @mappers = parse_patterns($patterns, $class);
+my @prev_mappers = parse_patterns($prev_patterns, $class);
+
+#
+# Now run the mappers.
+#
+if ($class eq "user")
+{
+    foreach my $user (@users)
+    {
+        my @dependency_failed_mappers;
+        my $run_zzreload = 0;
+        foreach my $mapper (@mappers)
+        {
+            # if zzreload pops up as a mapper script let's wait until all other
+            # scripts finish running to call it
+            if ($mapper eq $zzreload)
+            {
+                $run_zzreload = 1;
+                next;
+            }
+            if (check_dependencies($mapperDir, $mapper))
+            {
+                run("$mapperDir/$mapper", $action, $user, $mode);
+            }
+            else
+            {
+                $logger->log('debug', "$mapperDir/$mapper $action $user $mode: Failed dependencies found.  Will check again after all other mapper scripts are run");
+
+                # Add to failed dependency list
+                push(@dependency_failed_mappers, "$mapperDir/$mapper");
+
+                # Mark as error to avoid unmap below
+                $mappers_run{"$mapperDir/$mapper"} = -1;
+            }
+        }
+        foreach my $failed_mapper (@dependency_failed_mappers)
+        {
+            my ($failed_mapper_dir, $failed_mapper_file) = split('/', $failed_mapper, 2);
+            if (check_dependencies($failed_mapper_dir, $failed_mapper_file))
+            {
+                $logger->log('debug', "Running $failed_mapper for $user, dependency check has succeeded after running all other mapper scripts");
+                run("$failed_mapper", $action, $user, $mode);
+            }
+            else
+            {
+                $logger->log('error', "$failed_mapper $action $user $mode: Failed dependencies");
+            }
+        }
+        # after all mapper scripts have finished running and if we were trying to
+        # run zzreload at some point, run zzreload now.
+        if ($run_zzreload)
+        {
+            # run zzreload.pl after all mapper scripts have finished running
+            run("$mapperDir/$zzreload", $action, $user, $mode);
+        }
+    }
+}
+else
+{
+    my @dependency_failed_mappers;
+    my $run_zzreload = 0;
+    foreach my $mapper (@mappers)
+    {
+        # if zzreload pops up as a mapper script let's wait until all other
+        # scripts finish running to call it
+        if ($mapper eq $zzreload)
+        {
+            $run_zzreload = 1;
+            next;
+        }
+        if (check_dependencies($mapperDir, $mapper))
+        {
+            run("$mapperDir/$mapper", $action, $mode);
+        }
+        else
+        {
+            $logger->log('debug', "$mapperDir/$mapper $action $mode: Failed dependencies found.  Will check again after all other mapper scripts are run");
+
+            # Add to failed dependency list
+            push(@dependency_failed_mappers, "$mapperDir/$mapper");
+
+            # Mark as error to avoid unmap below
+            $mappers_run{"$mapperDir/$mapper"} = -1;
+        }
+    }
+    foreach my $failed_mapper (@dependency_failed_mappers)
+    {
+        my ($failed_mapper_dir, $failed_mapper_file) = split('/', $failed_mapper, 2);
+        if (check_dependencies($failed_mapper_dir, $failed_mapper_file))
+        {
+            $logger->log('debug', "Running $failed_mapper, dependency check has succeeded after running all other mapper scripts");
+            run("$failed_mapper", $action, $mode);
+        }
+        else
+        {
+            $logger->log('error', "$failed_mapper $action $mode: Failed dependencies");
+        }
+    }
+    # after all mapper scripts have finished running and if we were trying to
+    # run zzreload at some point, run zzreload now.
+    if ($run_zzreload)
+    {
+        # run zzreload.pl after all mapper scripts have finished running
+        run("$mapperDir/$zzreload", $action, $mode);
+    }
+}
+
+#
+# If any mapper was just removed from the list, run it with the "unmap"
+# action, so it will revert its config to its pre-GP state.
+#
+if ($action eq "map")
+{
+    foreach my $mapper (@prev_mappers)
+    {
+        if (!defined($mappers_run{"$mapperDir/$mapper"}))
+        {
+            run("$mapperDir/$mapper", "unmap");
+
+            if ($mapper eq $CENTRIFYDC_MAPPER)
+            {
+                #
+                # We've just reverted our configuration back to its
+                # pre-GP settings; restart the daemon.
+                #
+                run("/usr/share/centrifydc/bin/centrifydc", "restart");
+            }
+        }
+    }
+}
+
+#
+# Release the lock.  It would be implicitly released if we just exited,
+# but this is more correct.
+#
+flock(LOCK, LOCK_UN);
+close(LOCK);
+
+exit(0);
+
+# vim: set filetype=perl :

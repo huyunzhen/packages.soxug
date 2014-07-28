@@ -1,0 +1,1243 @@
+#!/bin/sh
+#
+# $Change: 108300 $
+# $Revision: #1 $
+# $DateTime: 2014/01/20 12:11:06 $
+#
+# This adedit script reads zones from AD and flattens them into a sqlite database
+# it can load multiple roots plus multiple classic zones
+# The database consists of 2 sets of data
+# a - a logical copy of the data from AD - unprocessed
+# b - two tables that expand that into effectives users for each machine
+#
+# the next line restarts using tclsh \
+exec adedit "$0" "$@"
+package require ade_lib
+package require sqlite3
+
+# the config file is actually a tcl file that gets 'sourced'
+# it must establish bindings then call 'load_root' for each zone
+# note that it doesnt make sense to load data from multiple forests
+# make sure you have bindings to all domains 
+# - child zones may be in different domains
+# - users may be in different domains (or forests)
+# - in most cases you should turn cache on too
+# eg
+# cache -file "[get_temp_dir]/cache.db" on
+# Note that get_temp_dir returned a only-root/world writable temporary directory based on
+# if the running user is root. It is more secure against race condition.
+#
+#bind smoke2k3.centrify.test administrator xxxx
+#bind child12k3.smoke2k3.centrify.test administrator xxxx
+#load_root "CN=ng_parent,CN=Zones,CN=Centrify,DC=smoke2k3,DC=centrify,DC=test"
+#
+
+set SysRight_Password 1 
+set SysRight_SSO 2 
+set SysRight_AllowDisabled 4
+set SysRight_NormalShell 8
+set SysRight_NoAudit 16
+set SysRight_AuditRequired 32
+set SysRight_AlwaysPermitLogin 64
+set SysRight_And_Bits $SysRight_NoAudit
+set SysRight_Init $SysRight_NoAudit
+set allADUsers "all ad users"
+
+proc MergeSysRights { sysright1 sysright2 } {
+    return [expr { (($sysright1 | $sysright2) & ~ $::SysRight_And_Bits) | ($sysright1 & $sysright2 & $::SysRight_And_Bits) }]
+}
+
+proc SysRightToAuditLevel { sysright } {
+    if { $sysright & $::SysRight_AuditRequired } {
+        return "AuditRequired"
+    } elseif { $sysright & $::SysRight_NoAudit } {
+        return "AuditNotRequested"
+    }
+    return "AuditIfPossible"
+}
+
+proc usage {} {
+    puts {usage: addbloader -db <db path> -config <config file> [-v]}
+    exit 1
+}
+
+# Error detected and exit this program
+proc Error { msg stacktrace} {
+    puts "[clock format [clock seconds]] ERROR: < $msg >. Exit now."
+    if { [string length $stacktrace] != 0 } {
+        Verbose "Stack Trace: $stacktrace"
+    }
+    exit 1
+}
+
+proc Warning { msg } {
+    puts "[clock format [clock seconds]] WARN: < $msg >."
+}
+
+proc Info { msg } {
+    puts "[clock format [clock seconds]] INFO: < $msg >."
+}
+
+# offer milisecond to log messages
+proc LogWithMilliseconds { msg } {
+    set milliseconds [clock milliseconds] 
+    set ms [expr $milliseconds % 1000] 
+    puts "[clock format [clock seconds] -format "%a %b %d %H:%M:%S:$ms %z %Y"] $msg"
+}
+
+proc Verbose { msg } {
+    if { $::verbose } {
+        if { $::msecond } {
+            LogWithMilliseconds $msg
+        } else {
+            puts "[clock format [clock seconds]] $msg"
+        }
+    }
+}
+
+proc Verbose2 { msg } {
+    if { $::verbose2 } {
+        if { $::msecond } {
+            LogWithMilliseconds $msg
+        } else {
+            puts "[clock format [clock seconds]] $msg"
+        }
+    }
+}
+
+proc GetZoneName {path} {
+    return [string range [get_rdn $path] 3 end]
+}
+
+# creates the database
+proc make_db {dbpath db} {
+    catch {file delete $dbpath}
+    sqlite3 $db $dbpath
+
+    $db eval {
+        create table [assignment] ( 
+            [id] INTEGER  PRIMARY KEY  NOT NULL, 
+            treeid integer not null,
+            [role] INTEGER  NOT NULL, 
+            [principal] text  NOT NULL, 
+            bucket text null,
+            crole integer ,
+            zone integer null,
+            principal_type text not null,
+            [start] integer  NULL, 
+            [end] integer  NULL 
+        );
+         
+        CREATE TABLE [pam] ( 
+            [id] INTEGER  NOT NULL PRIMARY KEY , 
+            [name] text  NULL,
+            oname text NULL,
+            treeid integer not null,
+            description text null, 
+            application text not null,
+            zone integer not null
+        ); 
+        
+        create table command ( 
+            [id] INTEGER  NOT NULL PRIMARY KEY , 
+            cmd_name text  NULL, 
+            treeid integer not null,
+            description text null, 
+            cmd text not null,
+            path text not null,
+            form integer,
+            dzdo_runas text,
+            dzsh_runas text,
+            keep_env text,
+            del_env text,
+            add_env text,
+            priority integer,
+            umask int,
+            flags integer,
+            zone integer not null
+        );
+         
+        CREATE TABLE [role] ( 
+            [id] INTEGER  PRIMARY KEY  NOT NULL, 
+            treeid integer not null,
+            [name] text NOT NULL, 
+            [timebox] blob, 
+            [sysrights] INTEGER  NULL, 
+            rsh text null, 
+            description text null, 
+            zone integer
+        ); 
+        
+        create table role_pam ( 
+            role integer not null, 
+            pam integer not null 
+        );
+        
+        create table role_cmd ( 
+            role integer not null, 
+            [cmd] integer not null 
+        );
+
+        create table nssuser (
+            [id] INTEGER  NOT NULL PRIMARY KEY ,
+            zone integer not null,
+            aduser text not null,
+            uid integer,
+            gid integer,
+            shell text,
+            home text,
+            gecos text,
+            uname text
+        );
+        
+        create table nssgroup (
+            [id] INTEGER NOT NULL PRIMARY KEY,
+            zone integer not null,
+            adgroup text not null,
+            name text,
+            gid integer
+        );
+
+        create table zone (
+            [id] INTEGER  NOT NULL PRIMARY KEY ,
+            treeid integer not null,
+            path text not null collate nocase,
+            ztype text not null,
+            parent integer,
+            name text not null
+        );
+        
+        create table crole (
+            id integer not null primary key,
+            name text not null,
+            path text not null,
+            zone integer not null,
+            [group] text not null
+        );
+        
+        create table computer (
+            id integer not null primary key,
+            zone integer not null,
+            samname text,
+            dnsname text not null,
+            shortname text,
+            domain text
+        );
+        
+        create table aduser (
+            id integer not null primary key,
+            upn text not null
+        );
+        
+        create table adgroup (
+            id integer not null primary key,
+            name text not null 
+        );
+        
+        create table member (
+            adgroup integer not null,
+            aduser integer not null
+        );
+        
+        create table effective_user (
+            aduser integer not null,
+            target integer not null,
+            type text not null,
+            uname text not null,
+            uid integer not null,
+            shell text,
+            home text,
+            gecos text,
+            gid integer,
+            passflag integer,
+            ssoflag integer,
+            allowflag integer,
+            shellflag integer,
+            permitflag integer,
+            auditlevel text
+        );
+        
+        create table effective_group (
+            adgroup integer not null,
+            target integer not null,
+            type text not null,
+            name text not null,
+            gid integer not null
+        );
+        
+        create table effective_assignment (
+            target integer not null,
+            type text not null,
+            aduser integer not null,
+            role integer not null
+        );
+        
+        create table effective_role (
+            target integer not null,
+            type text not null,
+            role integer not null
+        );
+        
+        create table effective_pam (
+            target integer not null,
+            type text not null,
+            pam integer not null
+        );
+        
+        create table effective_command (
+            target integer not null,
+            type text not null,
+            command integer not null
+        );
+         
+        create index idx1 on assignment(role asc); 
+        create index idx2 on role_pam(role asc); 
+        create index idx3 on role_pam(pam asc); 
+        create index idx4 on role_cmd(role asc); 
+        create index idx5 on role_cmd(cmd asc); 
+        create index idx9 on computer(dnsname);
+        create index idx17 on computer(samname);
+        create index idx13 on adgroup(name);
+        create index idx14 on aduser(upn);
+		
+
+-- create view for user
+        CREATE VIEW UserView AS
+        SELECT  zone.name as zone_name, computer.dnsname as computer_name, aduser.upn as user_upn, eu.uname, eu.uid, eu.home, eu.shell, eu.gid, 
+                eu.passflag, eu.ssoflag, eu.allowflag, eu.shellflag, eu.permitflag, eu.auditlevel 
+        FROM zone 
+        INNER JOIN computer ON (zone.id=computer.zone) 
+        LEFT JOIN effective_user eu, aduser ON (eu.aduser=aduser.id and eu.target=computer.id and eu.type='c');
+
+-- create view for commands
+        CREATE VIEW CommandsView AS
+        SELECT  zone.name as zone_name, computer.dnsname as computer_name, aduser.upn as user_upn, role.name as role_name,  command.cmd_name, command.cmd as cmd_command, command.path as cmd_path, command.dzdo_runas as cmd_dzdo_runas, command.dzsh_runas as cmd_dzsh_runas 
+        FROM zone 
+        INNER JOIN computer ON (zone.id=computer.zone) 
+        LEFT JOIN effective_assignment ea, aduser ON (computer.id=ea.target and ea.type='c' and ea.aduser=aduser.id) 
+        LEFT JOIN role ON (ea.role=role.id and zone.id=role.zone) 
+        LEFT JOIN role_cmd ON (role_cmd.role=role.id) 
+        LEFT JOIN command ON (role_cmd.cmd=command.id);  
+
+-- create view for PAM
+        CREATE VIEW PamView AS
+        SELECT  zone.name as zone_name, computer.dnsname as computer_name, aduser.upn as user_upn, role.name as role_name, pam.name as pam_name, pam.oname as pam_oname, pam.description as pam_desc, pam.application as pam_application  
+        FROM zone 
+        INNER JOIN computer ON (zone.id=computer.zone) 
+        LEFT JOIN effective_assignment ea, aduser ON (computer.id=ea.target and ea.type='c' and ea.aduser=aduser.id) 
+        LEFT JOIN role ON (ea.role=role.id and zone.id=role.zone) 
+        LEFT JOIN role_pam ON (role_pam.role=role.id) 
+        LEFT JOIN pam ON (role_pam.pam=pam.id);
+
+-- create view for assignment
+        CREATE VIEW AssignmentView AS
+        SELECT zone.name as zone_name, assignment.principal_type, assignment.principal as user_upn, role.name as role_name, crole.name as crole_name 
+        FROM zone
+        INNER JOIN assignment ON (assignment.zone=zone.id) 
+        INNER JOIN role ON (assignment.role=role.id)
+        LEFT JOIN crole ON (assignment.crole=crole.id);
+
+-- create view for effective assignment
+        CREATE VIEW EffAssignmentView AS
+        SELECT zone.name as target_name, effective_assignment.type as target_type, aduser.upn as user_upn, role.name as role_name 
+        FROM effective_assignment, role, aduser, zone 
+        WHERE effective_assignment.role=role.id AND effective_assignment.aduser=aduser.id AND type='z' AND ztype="tree" AND effective_assignment.target=zone.id 
+        UNION 
+        SELECT computer.dnsname as target_name, effective_assignment.type as target_type, aduser.upn as user_upn, role.name as role_name 
+        FROM effective_assignment, role, aduser, computer 
+        WHERE effective_assignment.role=role.id AND effective_assignment.aduser=aduser.id AND type='c' AND effective_assignment.target=computer.id;
+
+-- create view for role
+        CREATE VIEW RoleView AS
+        SELECT zone.name as zone_name, role.name as role_name, role.timebox, role.sysrights, role.rsh
+        FROM role, zone 
+        WHERE role.zone=zone.id;
+
+-- create view for effective role
+        CREATE VIEW EffRoleView AS
+        SELECT zone.name as target_name, effective_role.type as target_type, role.name as role_name 
+        FROM zone 
+        LEFT JOIN effective_role ON (effective_role.target=zone.id AND effective_role.type='z')
+        INNER JOIN role ON (effective_role.role=role.id)
+        UNION 
+        SELECT computer.dnsname as target_name, effective_role.type as target_type, role.name as role_name 
+        FROM computer 
+        LEFT JOIN effective_role ON (effective_role.target=computer.id AND effective_role.type='c')
+        INNER JOIN role ON (effective_role.role=role.id);
+		
+    }
+
+    
+# change to SQLite to not use memory for temporary tables
+    $db eval {PRAGMA synchronous=OFF}
+#     $db eval {PRAGMA temp_store=MEMORY}
+    $db eval {PRAGMA temp_store=FILE}
+    $db eval {PRAGMA count_changes=OFF}
+    $db eval {PRAGMA default_synchronous=OFF}
+#    $db eval {PRAGMA default_temp_store=MEMORY}
+    $db eval {PRAGMA journal_mode=OFF}
+}
+
+proc IsAllADUserGroup { group } {
+    return [string equal -nocase $group "All AD users"]
+}
+
+proc IsAllUnixLocalUserGroup { group } {
+    return [string equal -nocase $group "All unix users"]
+}
+
+# given a principal, check if it is a unix local user or group 
+proc IsUnixLocalUserOrGroup { principal } {
+    return [string match "*@localhost" $principal]  
+} 
+
+# Given a AD user returned from gzu, return its root AD user name.
+# If one AD user has multiple profiles, its UPN is changed by adedit by appendixing a "+" following the profile sequence number.
+# For example, given "chris.carter@centrify-qa.test+1", return "chris.carter@centrify-qa.test"
+proc GetUserRoot { user } {
+    set index [string last "+" $user]
+    if { $index == -1 } {
+        return $user
+    } else {
+        return [string range $user 0 $index-1]
+    } 
+}
+
+# Given the role assignment dictionary, check if at least one of All AD User role assignments exists. 
+proc HasAllADUserRole { assigndb } {
+    return [dict exists $assigndb $::allADUsers];
+}
+
+# Given a AD user, check if it has at least one role assignment in the current assigndb dictionary
+proc HasAtLeastOneRole { user assigndb} {
+    set userRoot [GetUserRoot $user]
+    if { [dict exists $assigndb $userRoot] == 1 } {
+        Verbose2 "==== $userRoot has at least one role"
+        return 1
+    } elseif { [HasAllADUserRole $assigndb] } {
+        Verbose2 "==== $userRoot has at least role related to 'all ad users'"
+        return 1
+    } else {
+        Verbose2 "==== $userRoot has no role"
+        return 0
+    }
+}
+
+proc open_db {dbpath db} {
+    sqlite3 $db $dbpath
+# change to SQLite to not use memory for temporary tables
+    $db eval {PRAGMA synchronous=OFF}
+#     $db eval {PRAGMA temp_store=MEMORY}
+    $db eval {PRAGMA temp_store=FILE}
+    $db eval {PRAGMA count_changes=OFF}
+    $db eval {PRAGMA default_synchronous=OFF}
+#    $db eval {PRAGMA default_temp_store=MEMORY}
+    $db eval {PRAGMA journal_mode=OFF}
+}
+
+#
+# this is called when we are in a zone or computer
+# we pass in the target(id) and type(z:zone, c:computer) a dict of the possible nss users
+# and a dict of the assigned roles
+# 
+# for uncondiional roles the role is just the role id
+# for conditional roles it is roleid/group id
+# where group id is the group a machine must belong to
+#
+# this then writes the effective users and their roles to the db 
+proc show_effective {db target type userdb assigndb groupdb roledb pamdb commanddb} {
+    Verbose "Number of user roles: [dict size $assigndb]"
+    set updatecount 0
+    array set sysrights	{}
+    dict for {user roles} $assigndb {
+	
+        # do nothing if it is a machine user
+        if { [string match "*$@*" $user] } continue;
+		
+        Verbose2 "==== Check user $user, role $roles, target $target, type $type"
+        
+        set sysright $::SysRight_Init
+        set has_role 0
+        set aduser [$db onecolumn {select id from aduser where upn = $user}]
+        if {$aduser == ""} {
+            $db eval {insert into aduser(upn) values($user)}
+            set aduser [$db last_insert_rowid] 
+        }
+        
+        foreach role [lsort -unique $roles] {
+            # Skip empty role
+            if {[string length $role] == 0} { continue }
+            set inrole 1
+            lassign [split $role "/"] role croleid
+            if { $croleid != "" } {
+                if { $type == "z" } {
+                    # we are in zone and it is a computer role, so we skip it.
+                    Verbose2 "==== Skip role $role, croleid $croleid, target $target, aduser $aduser"
+                    continue
+                } else {
+                    # its a conditional role - are we in it?
+                    # Check if the current target computer (specified by $target) is in this computer role (specified by $croleid)
+                    set group [$db eval {select [group] from crole where id=$croleid}] 
+                    Verbose2 "==== group is $group"
+                    set inrole [$db eval {select computer.id from 
+                            adgroup,member,aduser,computer where
+                            adgroup.name = $group and adgroup.id = member.adgroup and member.aduser = aduser.id 
+                            and aduser.upn = computer.samname and computer.id = $target}]
+                    Verbose2 "==== inrole is $inrole"
+                    if {$inrole == ""} {
+                        # skip this role assignment if this computer is not in the computer group defined by this computer role (specified by $croleid)
+                        Verbose2 "==== Skip role $role, croleid $croleid, target $target, group $group, aduser $aduser, inrole $inrole"
+                        set inrole 0
+                    }
+                }
+            }
+            
+            if {$inrole} {
+                set has_role 1
+                set sysright1 [$db eval {select sysrights from role where id = $role}]
+                if { $sysright1 != "" } {
+                    set sysright [MergeSysRights $sysright $sysright1]
+                } else {
+                    Warning "Error occurs. sysrights not found for role $role."
+                }
+                $db eval {insert into effective_assignment(target,type,aduser,role)
+                        values($target,$type,$aduser,$role)}
+                incr updatecount
+            }
+        }
+        Verbose2 "==== Set sysrights $sysright for user $user"
+        set sysrights($user) $sysright
+    }
+    Verbose "Role assignments added: $updatecount "
+    set updatecount 0
+    
+    foreach user [dict keys $userdb] {
+        # partial profiles are skipped
+        if {[dict exists $userdb $user uid] == 0} { 
+            Verbose2 "==== Skip user $user because of missing uid"
+            continue }
+        if {[dict exists $userdb $user uname] == 0} { 
+            Verbose2 "==== Skip user $user because of missing uname"
+            continue }
+        if {[dict exists $userdb $user shell] == 0} { 
+            Verbose2 "==== Skip user $user because of missing shell"
+            continue }
+        if {[dict exists $userdb $user home] == 0} { 
+            Verbose2 "==== Skip user $user because of missing home"
+            continue }
+        if {[dict exists $userdb $user gid] == 0} { 
+            Verbose2 "==== Skip user $user because of missing gid"
+            continue }
+
+        Verbose2 "==== Processing user $user for effective user"
+		
+        if { [HasAtLeastOneRole $user $assigndb] > 0 } {
+            # write to db            
+            set aduser [$db onecolumn {select id from aduser where upn = $user}]
+            set uid [dict get $userdb $user uid]
+            Verbose2 "==== Processing user $user for effective user, uid is $uid"
+            set uname [dict get $userdb $user uname]
+            set gid [dict get $userdb $user gid]
+            set home [dict get $userdb $user home]
+            set shell [dict get $userdb $user shell]
+            if {[dict exists $userdb $user gecos] != 0} {
+                set gecos [dict get $userdb $user gecos]
+            }
+            if {$gid==0x80000000} {
+                # auto private group (for classic zone, this number shouldn't appear)
+                set gid $uid
+            }
+			
+            set userRoot [GetUserRoot $user]
+            if { [info exists sysrights($userRoot)] } {
+                if { [HasAllADUserRole $assigndb] } {
+                    set finalsysrights [MergeSysRights $sysrights($userRoot) $sysrights($::allADUsers)] 
+                } else {
+                    set finalsysrights $sysrights($userRoot)
+                }
+            } elseif { [HasAllADUserRole $assigndb] } {
+                set finalsysrights $sysrights($::allADUsers)
+            } else {
+                Warning "User $user has no role assigned.  Please double check it."
+                continue
+            }
+            set passflag [expr { ( $finalsysrights & $::SysRight_Password)? 1: 0} ]
+            set ssoflag [expr { ( $finalsysrights & $::SysRight_SSO)? 1: 0} ]
+            set allowflag [expr { ( $finalsysrights & $::SysRight_AllowDisabled)? 1: 0} ]
+            set shellflag [expr { ( $finalsysrights & $::SysRight_NormalShell)? 1: 0} ]
+            set permitflag [expr { ( $finalsysrights & $::SysRight_AlwaysPermitLogin)? 1: 0} ]
+            set auditlevel [SysRightToAuditLevel $finalsysrights]
+            $db eval {
+                insert into effective_user(target,type,aduser,uid,uname,home,shell,gecos,gid,passflag,ssoflag,allowflag,shellflag,permitflag,auditlevel)
+                    values($target,$type,$aduser,$uid,$uname,$home,$shell,$gecos,$gid,$passflag,$ssoflag,$allowflag,$shellflag,$permitflag,$auditlevel)
+            }
+            incr updatecount
+        }
+    }
+    
+    $db eval {end transaction}
+    Verbose "Effective users added: $updatecount "
+    set updatecount 0
+    $db eval {begin transaction}
+
+    dict for {group groupdict} $groupdb {
+        if {[dict exists $groupdict gid] == 0} {continue}
+        if {[dict exists $groupdict name] == 0} {continue}
+        set gid [dict get $groupdict gid]
+        set name [dict get $groupdict name]
+        set adgroup [$db eval {select id from adgroup where name=$group}]
+        if { $adgroup == "" } {
+            $db eval {insert into adgroup(name) values($group)}
+            set adgroup [$db last_insert_rowid]
+        }
+        $db eval {insert into effective_group(target,type,adgroup,gid,name)
+                values($target,$type,$adgroup,$gid,$name)
+        }
+    }
+    
+    dict for {roleid -} $roledb {
+        $db eval {insert into effective_role(target,type,role)
+                values($target,$type,$roleid)
+        }
+    }
+    
+    dict for {pamid -} $pamdb {
+        $db eval {insert into effective_pam(target,type,pam)
+                values($target,$type,$pamid)
+        }
+    }
+    
+    dict for {commandid -} $commanddb {
+        $db eval {insert into effective_command(target,type,command)
+            values($target,$type,$commandid)
+        }
+    }
+    $db eval {end transaction}
+    $db eval {begin transaction}
+}
+
+proc GetMemberList { db upn } {
+    if { [IsAllADUserGroup $upn] } {
+        Verbose "All AD User -- expanding < $upn >"
+        return [$db eval {select upn from aduser}]
+    } else {
+        return [$db eval {select upn from aduser,adgroup,member 
+            where aduser.id = member.aduser and member.adgroup = adgroup.id and adgroup.name = $upn }]
+    }
+}
+
+# walk the tree recursively
+# we write it to the database when we are at computer zone, zone, or zone computer.
+proc push_node2 {db userdb userroles groupdb roledb pamdb commanddb zoneid ztype zpath} {
+    # gather all the NSS data in this node
+    Verbose "Finalization: $zpath zone ID: $zoneid "
+    $db eval {select * from nssuser where nssuser.zone = $zoneid} userrow {
+        if {$userrow(uid) != ""} {dict set userdb $userrow(aduser) uid $userrow(uid) }
+        if {$userrow(uname) != ""} {dict set userdb $userrow(aduser) uname $userrow(uname) }
+        if {$userrow(gecos) != ""} {dict set userdb $userrow(aduser) gecos $userrow(gecos) }
+        if {$userrow(shell) != ""} {dict set userdb $userrow(aduser) shell $userrow(shell) }
+        if {$userrow(home) != ""} {dict set userdb $userrow(aduser) home $userrow(home) }
+        if {$userrow(gid) != ""} {dict set userdb $userrow(aduser) gid $userrow(gid) }
+		Verbose2 "==== Add user $userrow(aduser) to userdb, uid=$userrow(uid)"
+    }
+    
+    $db eval {select * from nssgroup where nssgroup.zone = $zoneid} grouprow {
+        if {$grouprow(gid) != ""} {dict set groupdb $grouprow(adgroup) gid $grouprow(gid) }
+        if {$grouprow(name) != ""} {dict set groupdb $grouprow(adgroup) name $grouprow(name) }
+    }
+    
+    $db eval {select [id] from role where zone=$zoneid} {
+        dict set roledb $id 1
+    }
+    
+    $db eval {select [id] from pam where zone=$zoneid} {
+        dict set pamdb $id 1
+    }
+    
+    $db eval {select [id] from command where zone=$zoneid} {
+        dict set commanddb $id 1
+    }
+
+    # get all the assignments in this node
+    Verbose "Start calculating effective assignments for zone $zoneid..."
+    $db eval {select * from assignment where zone = $zoneid} asgrow {
+        if {$asgrow(crole) != ""} {
+            set rname $asgrow(role)/$asgrow(crole)
+        } else {
+            set rname $asgrow(role)
+        }
+            
+        Verbose "Adding effective assignments for $asgrow(principal), $rname"
+        if {$asgrow(principal_type) == "u"} {
+            dict lappend userroles $asgrow(principal) $rname
+        } elseif {$asgrow(principal_type) == "a"} {
+            Verbose2 "==== adding role assignment: $asgrow(principal) $rname"
+            dict lappend userroles $asgrow(principal) $rname
+        } else {
+            foreach member [GetMemberList $db $asgrow(principal)] {
+                Verbose2 "==== adding member $member"
+                dict lappend userroles $member $rname
+            }
+        } 
+    }
+    
+    # a leaf - stop
+    if {$ztype == "computer"} {
+        set compid [$db eval {select computer.id from computer,zone where zone.name = computer.dnsname and zone.id = $zoneid}]
+        Verbose "Setting effective information for computer zone $zoneid"
+        show_effective $db $compid c $userdb $userroles $groupdb $roledb $pamdb $commanddb
+        return
+    } else {
+        Verbose "Setting effective information for tree zone $zoneid"
+        show_effective $db $zoneid z $userdb $userroles $groupdb $roledb $pamdb $commanddb
+    }
+    
+    # get child zones - recurse 
+    $db eval {select * from zone where parent = $zoneid and ztype = 'tree'} zonerow {
+        push_node2 $db $userdb $userroles $groupdb $roledb $pamdb $commanddb $zonerow(id) $zonerow(ztype) $zonerow(path)
+    }
+    
+    # get the computers (if any)
+    Verbose "Checking computers for effective assignment for zone $zpath"
+    $db eval {select * from computer where zone = $zoneid} comprow { 
+        set czone [$db eval {select id from zone where name = $comprow(dnsname) and parent = $zoneid}    ]
+        if {[llength $czone] == 0} {
+            # no computer zone
+            Verbose "Not a computer zone...calculate effective information for computer $comprow(dnsname) "
+            show_effective $db $comprow(id) c $userdb $userroles $groupdb $roledb $pamdb $commanddb
+        } else {
+            # computer zone - recurse to get its NSS data
+            Verbose "A computer zone...calculate effective information recusively for $czone"
+            push_node2 $db $userdb $userroles $groupdb $roledb $pamdb $commanddb $czone computer $comprow(dnsname)
+        }
+    }
+}
+
+proc load_command {db zone zone_id treeid } {
+    set zone_name [GetZoneName $zone]
+    Verbose "Loading commands for zone $zone_name"
+    select_zone $zone
+    foreach command [get_dz_commands] {
+        select_dz_command $command
+        set qname "$command/$zone_name"
+        set cmd         [get_dzc_field cmd        ]
+        set path        [get_dzc_field path       ]
+        set form        [get_dzc_field form       ]
+        set dzdo_runas  [get_dzc_field dzdo_runas ]
+        set dzsh_runas  [get_dzc_field dzsh_runas ]
+        set pri         [get_dzc_field pri        ]
+        set umask       [get_dzc_field umask      ]
+        set flags       [get_dzc_field flags      ]
+        set keep        [get_dzc_field keep       ]
+        set del         [get_dzc_field del        ]
+        set add         [get_dzc_field add        ]
+        set description [get_dzc_field description]
+        $db eval {insert into
+            command(treeid, cmd_name, description, cmd, path, form, dzdo_runas, dzsh_runas, keep_env, del_env, add_env, priority, umask, flags, zone)
+            values($treeid, $qname, $description, $cmd, $path, $form, $dzdo_runas, $dzsh_runas, $keep, $del, $add, $pri, $umask, $flags, $zone_id)
+        }
+    }
+}
+
+# load an AD group into DB
+proc load_group {db group} {
+    Verbose "Loading group $group"
+    if { [IsAllUnixLocalUserGroup $group] } { return }
+    if { [string match "*@localhost" $group] } {
+        Verbose "skip local group $group"
+        return
+    }
+
+    $db eval {begin transaction}
+    set gid [$db eval {select id from adgroup where name = $group}]
+    if {[llength $gid] == 0} {
+        $db eval {insert into
+            adgroup(name)
+            values($group)}
+        set gid [$db last_insert_rowid]
+
+        if { [IsAllADUserGroup $group] } { 
+            $db eval {select * from aduser} aduserrow {
+                set uid $aduserrow(id)
+                Verbose2 "==== Add entry < $group, $aduserrow(upn) > to member table for group < $group >"
+                $db eval {insert into
+                    member(adgroup, aduser)
+                    values($gid, $uid) }
+            }
+            
+        } else {
+        
+            if {[catch {set members [get_group_members $group]} errmsg]} {
+                Warning "Failed to get group member in < $group > due to error:  $errmsg"
+            } else {
+                if {[llength $members] > 1000} {
+                Verbose "Group $group has [llength $members] members.."
+                }
+                foreach member $members {
+                    set uid [$db eval {select id from aduser where upn = $member}]
+                    if {[llength $uid] == 0} {
+                        $db eval {insert into aduser(upn) values($member)}
+                        set uid [$db last_insert_rowid]
+                    }
+     
+                    Verbose2 "==== Add entry < $group, $member> to member table"
+                    $db eval {insert into
+                        member(adgroup, aduser)
+                        values($gid, $uid)}
+                    unset uid
+                }
+                unset members
+            }
+        }
+    }
+
+    $db eval {end transaction}
+    unset gid
+}
+
+proc load_zone_group {db treeid zoneid zname} {
+    Verbose "Loading zone group for zone $zname"
+    foreach zgroup [get_zone_groups] {
+        if {[string range $zgroup 0 0] == "*"} {continue}
+        Verbose "Loading zone group: $zgroup"
+        slzg $zgroup
+        set gid [gzgf gid]; if {$gid eq "-"} {unset gid}
+        set name [gzgf name];if {$name eq "-"} {unset name}
+        $db eval {insert into 
+            nssgroup(zone,adgroup,gid,name) 
+            values($zoneid,$zgroup,$gid,$name)}
+        load_group $db $zgroup
+    }
+}
+
+proc GetRoot { zone } {
+    slz $zone
+    set ztype [get_zone_field type]
+    if {$ztype != "tree" } {
+        return $zone
+    }
+    set parent [get_zone_field parent]
+    while { $parent != "" } {
+        slz $parent
+        set zone $parent
+        set parent [get_zone_field parent]
+    }
+    return $zone
+}
+
+# entry point for initial loading
+# pass in root of tree 
+proc load_root {path {db db1}} {
+    Verbose "Processing load_root for $path"
+    set rootpath [GetRoot $path]
+    if { [$db exists {select 1 from zone where path=$rootpath}] } { return }
+    
+    # Just change to use transaction when loading the zone; and another transaction to load the 
+    # roles to avoid excessive memory usage
+    # Actually for load_zone, it needs to be split into multiple transactions
+    #   $db eval {begin transaction}
+    
+    set treeid [$db onecolumn {select max(id) from zone}]
+    if {[llength $treeid] == 0} {
+        set treeid 0
+    }
+    incr treeid
+    load_zone $db $rootpath 0 $treeid
+    #load_zone $db $path 0 $treeid
+    load_roles $db $treeid 
+}
+
+proc load_users {db treeid zoneid zname} {
+    set login_name cl_login/$zname
+    set listed_name cl_listed/$zname
+
+    # use a transaction for loading all users
+    Verbose "Loading users for zone $zname"
+    $db eval {begin transaction}
+    set listed_rid [$db eval  {select id from role where name = $listed_name and treeid = $treeid}]
+    set login_rid [$db eval  {select id from role where name = $login_name and treeid = $treeid}]
+    foreach  zuser [get_zone_users] {
+
+        #Verbose "Loading user < $zuser >"
+        if {[llength $zuser] ==0 || [string range $zuser 0 0] == "*"} {continue}
+        Verbose2 "==== Loading user < $zuser >"
+        if {[catch {slzu $zuser} errmsg]} {
+            Warning "Failed to select zone user $zuser: $errmsg"
+            continue
+        }
+        set uid [gzuf uid];if {$uid eq "-"} {unset uid}
+        set gid [gzuf gid];if {$gid eq "-"} {unset gid}
+        set uname [gzuf uname];if {$uname eq "-"} {unset uname}
+        set shell [gzuf shell];if {$shell eq "-"} {unset shell}
+        set home [gzuf home];if {$home eq "-"} {unset home}
+        set gecos [gzuf gecos];if {$gecos eq "-"} {unset gecos}
+        set enabled ""
+        catch {
+            set enabled [gzuf enabled]
+        }
+        if {$enabled != ""} {
+            set gecos $zuser
+            if {$enabled == "1"} {
+                set rid $login_rid
+            } else {
+                set rid $listed_rid
+            }
+            $db eval {insert into
+                assignment(treeid, role, principal, principal_type, zone)
+                values($treeid, $rid, $zuser, 'u', $zoneid)}
+        }
+		Verbose2 "==== Insert user $zuser to aduser and nssuser table"
+        $db eval {insert into 
+            nssuser(zone, aduser, uid, gid, shell, home, gecos, uname) 
+            values($zoneid, $zuser, $uid, $gid, $shell, $home, $gecos, $uname)}
+        if { ![$db exists {select 1 from aduser where upn=$zuser}] } {
+            $db eval { insert into aduser(upn) values($zuser) }
+        }
+    }
+
+    $db eval {end transaction}
+}
+
+proc load_pam { db path parentid treeid {classic false}} {
+    slz $path
+    set zname [GetZoneName $path]
+    Verbose "Loading PAMs for zone $zname"
+    
+    foreach pam [get_pam_apps] {
+        slpam $pam
+        set app [gpf application]
+        set desc [gpf description]
+        if { $classic } {
+            set qname $app/$zname
+        } else {
+            set qname $pam/$zname
+        }
+        $db eval {insert into
+            pam(treeid, name, oname, application, description, zone)
+            values($treeid, $qname, $pam, $app, $desc, $parentid)}
+    }
+}
+
+# recusrive zone loading
+# this first pass simply copies the AD data model to database
+# it does not expand anything
+proc load_zone {db path parent treeid} {
+    slz $path
+    Verbose "Data load: $path"
+    set type [gzf type]
+    set zname [GetZoneName $path]
+    # save the zone
+    $db eval {insert into
+        zone(path, treeid, ztype, parent, name)
+        values($path, $treeid, $type, $parent, $zname)} 
+    set parentid [$db last_insert_rowid]
+    if { $type == "tree" } {
+        slz $path
+        # and computer zones
+        Verbose "Loading computer zones for $path"
+        if {[catch {set children [get_child_zones -computer]} errmsg]} {
+             Warning "Computer zone not found under zone $zname: $errmsg"
+        } else {
+            foreach  child $children {
+                Verbose "Loading computer zone: $child"
+                slz $child
+                set ctype [gzf type]
+                set czname [lindex [split $child "@"] 0]
+			    set cname [ lindex [ split $czname '.' ] 0 ]
+                set first [ string first "." $czname ]
+                set mdom [ string range $czname $first+1 [string length $czname] ]
+                $db eval {insert into
+                        zone(path, treeid, ztype, parent, name)
+                        values($child, $treeid, $ctype, $parentid, $czname)} 
+                set zid [$db last_insert_rowid]
+                load_users $db $treeid $zid $czname
+                load_zone_group $db $treeid $zid $czname
+                $db eval {insert into
+                            computer(dnsname, zone, shortname, domain)
+                            values($czname, $parentid, $cname, $mdom)}
+            }
+            unset children
+        }
+        slz $path
+        # and computer roles
+        Verbose "Loading computer roles for $path"
+        foreach  crole [get_child_zones -crole] {
+            slz $crole
+            Verbose "Loading computer role: $crole"
+            set group [gzf computers]
+            load_group $db $group
+            set czname [lindex [ split $crole "/" ] 1 ]
+            $db eval {insert into
+                crole(path, name, zone, [group]) 
+                values($crole, $czname, $parentid, $group)} 
+        }
+        load_command $db $path $parentid $treeid
+        load_pam $db $path $parentid $treeid
+    }
+    if {$type != "computer"} {
+        Verbose "Loading zone computers for zone $path"
+        foreach  computer [get_zone_computers] {
+            if {$computer == ""} {continue}
+            Verbose "Loading zone computer: $computer"
+            set cname [ lindex [ split $computer '@' ] 0 ]
+            set mdom [ lindex [ split $computer '@' ] 1 ]
+            set mname $cname@$mdom
+			set cname [string trimright $cname '$']
+            select_zone_computer $computer
+            set dnsname [get_zone_computer_field dnsname]
+            set excomp [$db eval {select id from computer where dnsname = $dnsname}]
+            if {$excomp == ""} {
+                $db eval {insert into
+                    computer(dnsname, zone, samname, shortname, domain)
+                    values($dnsname, $parentid, $mname, $cname, $mdom)}
+            } else {
+                $db eval {update computer set samname=$mname where id = $excomp}
+            }
+        }
+    }
+    
+    if {[string match "classic*" $type]} {
+        # we do not support classic zone BUG# 41766
+        Info "Classic zone is not supported"
+        exit 1; 
+    }
+    
+    load_users $db $treeid $parentid $zname
+    load_zone_group $db $treeid $parentid $zname
+    
+    # After loading current node, load its children
+    if { $type == "tree" } {
+        # get its children
+        foreach  child [get_child_zones -tree] {
+            load_zone $db $child $parentid $treeid
+        }
+    }
+}
+
+proc load_assignment {db asg treeid type zid path crole} {
+    # skip *SIDs
+    if {[string range $asg 0 0] == "*"} {
+        Warning "skipping foreign user assignment $asg"
+        return
+    }
+    Verbose "Loading role assignment $asg"
+    if {[catch {slra $asg} errmsg]} {
+        Warning "Failed to load role assignment for $asg: $errmsg. Skipping."
+        return
+    }
+    
+    set from [graf from]
+    set to [graf to]
+    set parts [split $asg / ]
+    set u [lindex $parts 0]
+    set r [lindex $parts 1]
+    set z [lindex $parts 2]
+    set qname $r/$z
+        
+    if {$type == "g"} {
+        load_group $db $u
+
+        # need to tell SQlite to shrink memory
+        $db eval {PRAGMA shrink_memory}
+    }
+
+    #FIXME: it is possible for more than one role having the same name and treeid.
+    Verbose "Insert role for user < $u >"
+    set rid [$db onecolumn  {select id from role where name = $qname and treeid = $treeid}]
+   
+    # a workaround to get ptype.
+    set ptype $type
+    if { [IsAllADUserGroup $u] } {
+        set ptype "a"
+    } elseif { [IsAllUnixLocalUserGroup $u] } {
+        set ptype "x"
+    } elseif { [IsUnixLocalUserOrGroup $u] } {
+        if { [string first "%" $u 0] == 0 } {
+            set ptype "%"
+        } else {
+            set ptype "#"
+        }
+    }
+
+    $db eval {insert into
+        assignment(treeid, role, principal, bucket, principal_type, zone, start, end, crole)
+        values($treeid, $rid, $u, $path, $ptype, $zid, $from, $to, $crole)}
+}
+
+
+proc load_base_roles {db treeid} {
+
+    $db eval { begin transaction }
+    $db eval {select * from zone where treeid = $treeid and ztype <> "computer" } zonerow {
+        Verbose "Loading role for zone: $zonerow(path)"
+        set path $zonerow(path)
+        slz $path
+        set type [gzf type]
+        foreach role  [get_roles] {
+            slr $role
+            set sysrights [grf sysrights]
+            set timebox [grf timebox]
+            set description [grf description]
+            set qname $role/$zonerow(name)
+            $db eval {insert into
+                role(treeid, name, sysrights, timebox, description, zone)
+                values($zonerow(treeid), $qname, $sysrights, $timebox, $description, $zonerow(id))}
+            set roleid [$db last_insert_rowid]
+            Verbose "Loading pam for role $role"
+            foreach pam [get_role_apps] {
+                Verbose "Loading PAM < $pam >"
+                set pid [$db onecolumn {select id from pam where name=$pam AND treeid=$treeid}]
+                if {[llength $pid] != 0} {
+                    $db eval {insert into role_pam(role, pam) values($roleid, $pid)}
+                }
+            }
+            Verbose "Loading command for role $role"
+            foreach command [get_role_commands] {
+                Verbose "Loading command < $command >"
+                set cid [$db onecolumn {select id from command where cmd_name=$command AND treeid=$treeid}]
+                if {[llength $cid] != 0} {
+                    $db eval {insert into role_cmd(role, cmd) values($roleid, $cid)}
+                }                
+            }
+        }
+    }
+    $db eval { end transaction }
+}
+ 
+proc load_roles {db treeid} {
+    global g_dbpath
+
+    load_base_roles $db $treeid
+
+    $db eval {PRAGMA shrink_memory}
+
+    $db eval {select * from zone where treeid = $treeid} zonerow {
+        Verbose "Loading assignments for: $zonerow(path)"
+        set path $zonerow(path)
+        slz $path
+        set asgs [get_role_assignments -user]
+        Verbose "Role assignments to users: [llength $asgs]"
+        foreach asg $asgs {
+            load_assignment $db $asg $zonerow(treeid) "u" $zonerow(id) $path ""
+        }
+
+
+        unset asgs
+
+        # tell SQLite to shrink memory usage
+        $db eval {PRAGMA shrink_memory}
+
+        set asgs [get_role_assignments -group]
+        Verbose "Role assignments to groups: [llength $asgs]"
+
+        foreach asg $asgs {
+            load_assignment $db $asg $zonerow(treeid) "g" $zonerow(id) $path ""
+        }
+        unset asgs
+    }
+
+    $db eval {select zone.treeid,crole.path,zone.id as zid,crole.id from crole,zone where zone.id = crole.zone and treeid = $treeid} zonerow {
+        Verbose "Loading crole assignments for: $zonerow(path)"
+        set path $zonerow(path)
+        slz $path
+        set asgs [get_role_assignments -user]
+        Verbose "Role assignments to users: [llength $asgs]"
+        foreach asg $asgs {
+            load_assignment $db $asg $zonerow(treeid) "u" $zonerow(zid) $path $zonerow(id)
+        }
+        Verbose "Role assignments to users: [llength $asgs]"
+        unset asgs
+
+        set asgs [get_role_assignments -group]
+        Verbose "Role assignments to groups: [llength $asgs]"
+
+        foreach asg $asgs {
+            load_assignment $db $asg $zonerow(treeid) "g" $zonerow(zid) $path $zonerow(id)
+        }
+        unset asgs
+    }
+}
+
+# having loada the data model now expand it
+proc explode {db} {
+    $db eval {begin transaction}
+
+    # create index in member and assignment tables before finalize
+    $db eval { create index idx15 on member(adgroup) }
+    $db eval { create index idx18 on member(aduser) }
+    $db eval { create index idx16 on assignment(zone) }
+
+    $db eval {select * from zone where ztype <> 'computer' and parent = 0} zonerow {
+        # calculating effective roles, etc.....    
+        push_node2 $db {} {} {} {} {} {} $zonerow(id) tree $zonerow(path)
+    }
+    $db eval {end transaction}
+
+    # create the indices on the effective_user and effective_group tables
+    Verbose "Create indices on effective_user and effective_group tables"
+    $db eval { create index idx6 on effective_user(target,aduser,type) }
+    $db eval { create index idx7 on effective_user(target,type) }
+    $db eval { create index idx8 on effective_user(aduser) }
+    $db eval { create index idx10 on effective_group(target,adgroup,type) }
+    $db eval { create index idx11 on effective_group(target,type) }
+    $db eval { create index idx12 on effective_group(adgroup) }
+
+}
+
+# load All AD Users into table 'aduser'
+# You can optional add following line or something like that to conf file before loading anything else:
+# load_ad_users DC=domain,DC=com (objectcategory=user)
+proc load_ad_users {container {filter ""} {db db1}} {
+    Verbose "Processing load_ad_users for $container"
+    Verbose "Additional filter is $filter"
+    set filterFull (&(objectcategory=person)(objectclass=user)$filter)
+    Verbose2 "Full filter is $filterFull"
+    foreach aduser [get_objects -depth sub $container $filterFull] {
+        if { [catch {
+            set upn [dn_to_principal $aduser]
+    
+            set uid [$db eval {select id from aduser where upn = $upn}]
+            if {[llength $uid] == 0} {
+                Verbose2 "==== Add user < $aduser > to aduser table"
+                $db eval {insert into aduser(upn) values($upn)}
+                set uid [$db last_insert_rowid]
+            }
+        } errmsg] } {
+            Info "Failed to load $aduser: $errmsg. Skipping."
+        } 
+    }    
+}
+
+# main entry point
+if { [info script] == "$::argv0" } {
+    # This file is being executed.
+    if {[getopt argv -config config] == 0} {
+        usage
+    }
+    if {[getopt argv -db dbpath] == 0} {
+        usage
+    }
+    
+    set ::verbose [getopt argv -v]
+    set ::verbose2 [getopt argv -v2]
+    set ::msecond [getopt argv -ms]
+    set db db1
+    Verbose "Building database schema";
+    make_db $dbpath $db
+    Verbose "Finish building database schema";
+    Verbose "Processing $config"
+    if { [catch { source $config } errmsg] } {
+        Error $errmsg $errorInfo
+        # fail fast; fix it and run me again
+    }
+    Verbose "Finish processing $config"
+
+    Verbose "Start building effective objects"
+    explode $db
+    Verbose "Finish building effective objects"
+} else {
+    # this file is being sourced. (adzonediff does it)
+    if { ![info exists ::verbose] } {
+        set ::verbose 1
+    }    
+}

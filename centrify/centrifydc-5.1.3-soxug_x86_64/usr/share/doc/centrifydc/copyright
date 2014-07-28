@@ -1,0 +1,19 @@
+This package was debianized by the alien program by converting
+a binary .rpm package on Thu, 23 Jan 2014 07:11:14 -0800
+
+Copyright: Copyright 2004-2014 Centrify Corporation
+
+Information from the binary package:
+Name        : CentrifyDC                   Relocations: (not relocatable)
+Version     : 5.1.3                             Vendor: Centrify Corporation
+Release     : 482                           Build Date: Thu 23 Jan 2014 07:10:51 AM PST
+Install Date: (not installed)               Build Host: build34-deb5x64.Centrify.com
+Group       : Applications/System           Source RPM: CentrifyDC-5.1.3-482.src.rpm
+Size        : 66289910                         License: Copyright 2004-2014 Centrify Corporation
+Signature   : (none)
+Packager    : Vadim Gorelik <vadim.gorelik@centrify.com>
+URL         : http://www.centrify.com/
+Summary     : Centrify DirectControl Agent
+Description :
+RPM to install Centrify DirectControl on Linux x86 platforms.
+

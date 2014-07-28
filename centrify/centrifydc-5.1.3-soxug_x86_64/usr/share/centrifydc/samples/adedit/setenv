@@ -1,0 +1,59 @@
+# Setenv file contents
+# Purpose: Sets up a common environment for the following AD tools, selecting the 
+# Active Directory Domain, binding the user, and defining commonly used variables
+# Other AD tools
+#	GetZones
+#	GetUsers
+#	GetGroups
+#	GetChildZones
+#	GetComputers
+
+puts "
+This portion of the script prompts you to enter the domain and account name for the bind command."
+
+# If you are always using the same domain, comment out the puts and gets and use the set command instead
+puts "
+Enter the domain name"
+gets stdin domain
+# get the distinguished name for the domain.
+set domaindn [dn_from_domain $domain]
+
+
+puts "
+Enter administrator account name for bind command"
+gets stdin admin
+bind $domain $admin
+puts "
+bind to $domain complete"
+
+puts "
+The next two prompts ask you to enter the OU and container for your zone information"
+
+puts "
+Enter the name of the Active Directory container that holds the Centrify zone-related data"
+gets stdin zonesContainer
+# If you are always using the same zone, comment out the puts and gets and use the set command instead
+# set zonesContainer <AD container with zones data>
+
+puts "
+Enter the name of the organizational unit that has the zone container."
+
+gets stdin zonesContainerOU
+# If you are always using the same OU for the zone container, comment out the puts and gets and use the set command instead
+# set zonesContainerOU <AD OU with zones container>
+
+puts "
+Enter the base organizational unit with the Centrify managed computers data"
+gets stdin baseOU
+# If you are always using the same base OU, comment out the puts and gets commands and use the set command instead
+# set baseOU <base OU name> 
+
+puts "
+The next prompt asks for the parent zone."
+
+# If you are always using the same zone, comment out the puts and gets and use the set command instead
+# set parentZone <parent zone name>
+puts "
+Enter the parent zone name"
+gets stdin parentZone
+

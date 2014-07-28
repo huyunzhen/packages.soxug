@@ -1,0 +1,4 @@
+ApacheAdminRole
+vi /etc/httpd/conf/*
+apachectl *
+htpasswd *

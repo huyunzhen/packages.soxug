@@ -1,0 +1,51 @@
+# 
+# This sample file shows the password override syntax that can be used
+# on a per-machine basis for fine control over user passwd entry values.
+# This file should be managed through the Group Policy interface.
+#
+# The syntax is
+#
+# [+,-][user,@group]:name:passwd:uid:gid:gecos:home:shell
+#
+# Any field which is not specified will remain unchanged.  Users can be named
+# by Unix zone name or AD user@domain
+#
+# Overriding the password hash field will be ignored. It will not affect 
+# Centrify DirectControl user passwords. 
+#
+# In NIS, the @ symbol denotes a netgroup name. In this case, the @ symbol 
+# denotes an AD group name (unix, samAccount or canonical). 
+#
+# The user must already be zone enabled. Group need not be.
+#
+# Note that the plus and minus entries are evaluated in order from first 
+# to last with the first match taking precedence. This means the system 
+# will only use the first entry that matches a particular user. If, using 
+# the same example, there is a user "foo" who is a member of both the 
+# "staff" group and the "rejected-users" group, he will be admitted to the 
+# system because the above example lists the entry for "staff" before the 
+# entry for "rejected-users". If the order were reversed, user "foo" would 
+# be flagged as a "rejected-user" instead and denied access. 
+#
+# An empty (or non-existant) file is the equivalent of adding one line: +::::::
+# This mechanism could also be used in place of the allow/deny lists to the 
+# same effect, though they would be blocked at a different point.
+#
+# NOTE: If you manually create the passwd.ovr file, you must include
+# the following as the last line in the file: +:::::::
+#
+# NOTE: adflush MUST be run after changing this file
+#
+# Fields following a - entry are unnecessary and ignored if present
+#
++mike:::::::/usr/local/ultrabash
++paul:psmith:x:6:6:Paul Smith:/home/psmith:/bin/bash
++janedoe@centrify.test:jdoe::300:300:::
++@sysadmins:::::::
+-ftp
+-@webusers
+-@Accounting Users@acme.com
+-@acme.com/Users/Marketing
++@staff:::::::
++@rejected-users:::32767:32767:::/bin/false
++:::::::

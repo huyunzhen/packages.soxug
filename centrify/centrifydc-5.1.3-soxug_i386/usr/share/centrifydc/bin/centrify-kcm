@@ -1,0 +1,70 @@
+#!/bin/bash
+#
+# centrify-kcm
+#
+# Platform independent startup script for the Centrify-kcm service.  
+#
+# Description:  Centrify-kcm service interface support
+#
+# Copyright (C) 2013 Centrify Corp.
+# All rights reserved.
+#
+
+NAME="Centrify-KCM Service"
+USAGE="usage: $0 {start|stop|restart|condrestart|status} [options]"
+
+SERVICE=${SERVICE:-centrify-kcm}
+PROG=${PROG:-kcm}
+
+# Source CDC function library.
+. /usr/share/centrifydc/scripts/functions.start
+
+# Execute command
+#################
+
+identify_operating_system
+prepare_cmds
+
+# We don't want Centrify KCM service get auto-started at system boot.
+# For SMF service, temporary enable only lasts until reboot. 
+if [ "$TARGET_OS" = "solaris" -a -x "$SVC" ]; then
+    START_CMD="/usr/sbin/svcadm enable -st ${SERVICE}"
+fi
+
+get_uid
+
+CMD=$1
+[ $# -gt 0 ] && shift
+RETVAL=0
+RUNNING=0
+
+get_pids "$STATUS_CMD"
+[ -n "$PIDS" ] && RUNNING=1
+
+CMD_OPTIONS=""
+if [ "$PASS_OPTIONS" -eq 1 ]; then
+    CMD_OPTIONS="$@"
+fi
+case "$CMD" in
+    start)
+        start_service
+        ;;
+    stop)
+        stop_service
+        ;;
+    restart)
+        restart_service
+        ;;
+    condrestart)
+        condrestart_service
+        ;;
+    status)
+        status_service
+        ;;
+    *)
+        $ECHO $USAGE;
+        exit 1
+        ;;
+esac
+
+exit $RETVAL

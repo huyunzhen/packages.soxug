@@ -1,0 +1,93 @@
+#!/bin/env adedit
+
+# This script creates a role consisting of a set of privileged commands
+# The role and commands are specified in a file specified in the command line
+# See the files Role_....txt
+
+# The first line in the file should be the new role name. 
+# The subsequent lines are the names of the privileged commands to
+# add to the role.
+# For example:
+#	audit_admin_cmds
+#	/usr/bin/vi /etc/security/audit/config
+#	/usr/bin/vi /etc/security/audit/objects
+
+package require ade_lib
+
+if { $argc != 1 } {
+	puts "usage: $argv0 file"
+	exit 1
+}
+
+if {[catch {set fp [open [lindex $argv 0] r]} errmsg]} { 
+	puts "Cannot open [lindex $argv 0]."
+	exit 1
+}
+
+# Get domain and bind
+
+puts "Enter domain name"
+gets stdin domain 
+
+set domaindn [dn_from_domain $domain]
+
+puts "Enter account name with administrator privileges"
+gets stdin administrator
+
+puts "Enter $administrator password"
+gets stdin APWD
+
+bind $domain $administrator "$APWD"
+
+# Select the target zone and base organizational unit
+
+puts "
+Enter the target zone name for the new role"
+gets stdin zonename
+
+puts "
+Enter the name of the Active Directory container that holds the Centrify zone data"
+gets stdin zonesNode
+
+puts "
+Enter the organizational unit with the Centrify zone data container"
+gets stdin baseOU
+
+select_zone "cn=$zonename,cn=$zonesNode,ou=$baseOU,$domaindn"
+
+if {[gets $fp line] == -1} {
+	puts "Cannot read [lindex $argv 0]."
+	exit 1
+}
+
+# Create role
+
+puts "Creating role...$line"
+set role $line
+new_role "$role"
+save_role "$role"
+
+set count 0
+
+while {[gets $fp line] >= 0} {
+	incr count
+
+# Create command. Each command will be named based on the role
+# defined in the first line and the command’s line number in the file
+
+	set cmd_name $role$count
+	new_dz_command "$cmd_name"
+	# set the command fields
+	set cmd_path $line
+	set_dzc_field cmd "$cmd_path"
+	set_dzc_field dzdo_runas root
+	set_dzc_field umask 077
+	set_dzc_field flags 0
+	# save the command
+	save_dz_command
+	# Add the command to the Role
+	add_command_to_role "$cmd_name"
+}
+
+close $fp
+save_role "$role"

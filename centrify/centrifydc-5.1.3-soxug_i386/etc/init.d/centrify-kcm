@@ -1,0 +1,88 @@
+#!/bin/bash
+#
+# Debian startup script for Centrify-KCM Service.
+#
+# description: Centrify-KCM Service interface support
+# processname: kcm
+# config: /etc/krb5.conf
+
+# No LSB header here, it's not an auto-start service, normally it is started by adclient.
+
+PROGNAME=kcm
+# just to ensure $PIDFILE doesn't get initialized with the default value in functions.cdc, kcm doesn't create pid file.
+PIDFILE=/var/run/centrify-kcm.pid
+DAEMON=/usr/share/centrifydc/kerberos/sbin/kcm
+NAME="Centrify kcm"
+SERVICE_NAME=centrify-kcm
+
+# Configurable environment variables:
+#   DAEMON  Alternate daemon location and name
+#   ADINFO    Alternate location for adinfo command
+#   OPTIONS   Daemon command line options. These are combined with any
+#             additional command line parameters.
+
+# Source CDC function library.
+test -f /etc/centrifydc/scripts/functions.cdc || exit 0
+. /etc/centrifydc/scripts/functions.cdc
+
+test -f "$DAEMON" || exit 0
+
+# Execute command
+
+CMD=$1
+[ $# -gt 0 ] && shift
+OPTIONS="$OPTIONS $@"
+
+# Use Upstart to run CMD if needed
+run_with_upstart $CMD && exit $UPSTART_EXITCODE
+
+case "$CMD" in
+    start)
+        program_check
+        echo -n "Starting $NAME: "
+        start-stop-daemon --start --quiet --exec $DAEMON \
+            -- $OPTIONS
+        RETVAL=$?
+        if [ $RETVAL -eq 0 ]; then
+             echo "OK"
+        else
+             echo "FAILED"
+        fi
+        exit $RETVAL
+        ;;
+        
+    stop)
+        echo -n "Stopping $NAME: "
+        start-stop-daemon --stop --quiet --exec $DAEMON \
+            --retry TERM/1/1/1/1/1/KILL
+        RETVAL=$?
+        if [ $RETVAL -ne 0 ]; then
+            # Had to kill daemon. PID file wasn't cleaned up.
+            rm -f $PIDFILE
+        fi
+        [ $RETVAL -eq 0 ] && echo "OK" || echo "FAILED"
+        exit $RETVAL
+        ;;
+        
+    status)
+        program_status
+        if [ -n "$PID" ]; then
+            exit 0
+        else
+            exit 1
+        fi
+        ;;
+        
+    restart|force-reload)
+        $0 stop
+        $0 start $OPTIONS
+        ;;
+        
+    condrestart)
+        $0 status >/dev/null && $0 restart $OPTIONS
+        ;;
+                
+    *)
+        echo $"Usage: $0 {start|stop|status|restart|condrestart|force-reload}"
+        exit 1
+esac

@@ -1,0 +1,56 @@
+#
+# group.ignore (Debian)
+#
+# Speed up lookups for common groups who we know aren't in AD
+#
+# These values are controlled via group policy under 
+#   CentrifyDC Settings->Login Settings->Groups to Ignore (Lookup)
+#
+# The syntax is
+#
+# group_name
+#
+root
+bin
+daemon
+sys
+adm
+tty
+disk
+lp
+kmem
+mail
+news
+uucp
+proxy
+dialout
+fax
+voice
+floppy
+cdrom
+tape
+sudo
+audio
+dip
+www-data
+backup
+operator
+list
+irc
+src
+gnats
+shadow
+telnetd
+sasl
+staff
+games
+video
+staff
+users
+floppy
+utmp
+crontab
+Debian-exim
+nogroup
+ssh
+admin

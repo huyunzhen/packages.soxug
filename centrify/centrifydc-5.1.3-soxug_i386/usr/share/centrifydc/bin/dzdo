@@ -1,0 +1,6 @@
+#! /bin/sh
+
+unset _ 
+LD_LIBRARY_PATH=/usr/share/centrifydc/lib:/usr/share/centrifydc/kerberos/lib
+export LD_LIBRARY_PATH
+exec /usr/share/centrifydc/libexec/dzdo "$@"

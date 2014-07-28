@@ -1,0 +1,70 @@
+#!/bin/env adedit
+
+# This script lists all the users and their Active Directory account control values
+
+package require ade_lib
+
+# List users and the following field
+
+proc usage {msg} {
+	puts {usage: -domain <domain> [-m] [-u <user>] [-p <password>] [-sep csv | tab | <char>]}
+	puts $msg
+	exit 1
+}
+if {[getopt argv -domain domain] == 0} {
+	usage "Missing domain"
+}
+set verbose 0
+if {[getopt argv -v]} {
+	set verbose 1
+}
+set sep "|"
+getopt argv -sep sep
+if {$sep == "csv"} {set sep ","}
+if {$sep == "tab"} {set sep "\t"}
+
+if {[getopt argv -m]} {
+	bind -machine $domain 
+} else { 
+   if {[getopt argv -u user]} {
+      if {[getopt argv -p password]} {
+	bind $domain $user $password
+       } else {
+        bind $domain $user} 
+	} else {
+    bind $domain
+  }
+}
+cache on
+
+proc my_convert_msdate {msdate} {
+    if {$msdate==9223372036854775807} {
+        return -1
+    }
+    return [clock format [expr ($msdate/10000000)-11644473600] -format "%m/%d/%y %H:%M:%S"]
+}
+proc nice_date {date} {
+ if {$date == ""} {return $date}
+ if {$date == 0} {return ""}
+ set ret [my_convert_msdate $date]
+ if {$ret == -1} {return ""}
+ return $ret;
+}
+set users [get_objects -depth sub [dn_from_domain $domain] "(objectcategory=Person)"]
+
+foreach user $users {
+
+	select_object $user
+	set uac [get_object_field userAccountControl]
+	if {$uac == ""} {continue}
+	eval "set name [gof cn]"
+	#puts [gof dn]
+	set sam [gof sAMAccountName]
+	set exp [nice_date [gof accountExpires] ]
+	set locked [nice_date [gof lockoutTime] ]
+	set lastlogon [nice_date [gof lastLogon] ]
+	set enabled [expr $uac&0x2 ]
+	set enabstr "False"
+	if {$enabled} {set enabstr "True"}
+	puts $name$sep$sam$sep$exp$sep$locked$sep$lastlogon$sep$enabstr
+}

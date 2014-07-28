@@ -1,0 +1,573 @@
+#!/bin/sh
+#
+# $Change: 108300 $
+# $Revision: #1 $
+# $DateTime: 2014/01/20 12:11:06 $
+#
+# adzonediff -config <config file> [-u] [-v] [-users] [-groups] [-privileges] <dn of zone1> <dn of zone2>
+#
+#   [-users] [-groups] [-privileges]
+#     The upper items will be diff-ed by default, 
+#     otherwise just diff the specified.
+#   -config <config file>
+#       the config file is actually a tcl file, 
+#       to bind to single or multi domain(s)
+#       format:   bind $DOMAIN $USER $PASSWORD
+#       eg: the contents of the config file.
+#           bind smoke2k3.centrify.test administrator xxxx
+#           bind child12k3.smoke2k3.centrify.test administrator xxxx
+#       ------------------------------------------------------------
+#       it must establish bindings then can select_zone $zone
+#       	make sure you have bindings to all domains 
+#       	- child zones may be in different domains
+#       	- users may be in different domains (or forests)
+#       	- in most cases you should turn cache on too
+#   <dn of zone1> <dn of zone2>
+#   the dn of the zones to be compared with each others
+# it is assumed that the same user name can be used for all bindings
+# \
+exec adedit "$0" ${1+"$@"}
+package require ade_lib
+
+set check_headers {
+    users {upn uname uid gid shell home gecos}
+    users_sysrights {upn uname uid gid shell home gecos passflag ssoflag allowflag shellflag permitflag auditlevel}
+    groups {upn name gid}
+    pamapps {name application description}
+    commands {name cmd path form dzdo_runas dzsh_runas keep_env del_env add_env priority umask flags description}
+    roles {name timebox sysrights description pamapps commands}
+    assignments {aduser roles}
+}
+
+proc usage {msg} {
+    puts "$msg"
+    puts { adzonediff will do comparison of two zones. }
+    puts {      usage:-config <config file> [-v] [-u] [-users] [-groups] [-privileges] <dn of zone1> <dn of zone2>    }
+    puts {         -v: verbose}
+    puts {         -u: use unified diff format. (use +,- instead of >,<)}
+    puts {     -users: compare effective zone users }
+    puts {    -groups: compare effective zone groups }
+    puts {-privileges: compare pamapps, commands, roles, role assignments and sysright }  
+    exit 1
+}
+
+proc DebugPrint { dict1 } {
+    dict for {key value} $dict1 {
+        puts "$key:$value"
+    }
+} 
+
+proc PrintLine {{len 100}} {
+    puts [join [lrepeat $len -] ""]
+}
+
+proc GetEffectiveUsers { db zoneid } {
+    set users [dict create]
+    $db eval {
+        SELECT upn,uname,uid,gid,shell,home,gecos
+        FROM aduser,effective_user as eu
+        WHERE aduser.id=eu.aduser AND eu.type='z' AND eu.target=$zoneid
+        ORDER BY upn
+    } {
+        dict set users $upn [list $uname $uid $gid $shell $home $gecos]
+    }
+    return $users
+}
+
+proc GetEffectiveUsersSysrights { db zoneid } {
+    set users [dict create]
+    $db eval {
+        SELECT upn,uname,uid,gid,shell,home,gecos,passflag,ssoflag,allowflag,shellflag,permitflag,auditlevel
+        FROM aduser,effective_user as eu
+        WHERE aduser.id=eu.aduser AND eu.type='z' AND eu.target=$zoneid
+        ORDER BY upn
+    } {
+        dict set users $upn [list $uname $uid $gid $shell $home $gecos $passflag $ssoflag $allowflag $shellflag $permitflag $auditlevel]
+    }
+    return $users
+}
+
+proc GetEffectiveGroups { db zoneid } {
+    set groups [dict create]
+    $db eval {
+        SELECT ag.name AS upn,gid,eg.name
+        FROM adgroup AS ag,effective_group AS eg
+        WHERE ag.id=eg.adgroup AND eg.type='z' AND eg.target=$zoneid
+        ORDER BY upn
+    } {
+        dict set groups $upn [list $name $gid]
+    }
+    return $groups
+}
+
+proc GetEffectivePamapps { db zoneid } {
+    set pamapps [dict create]
+    $db eval {
+        SELECT pam.id,name as fullname,description,application
+        FROM pam,effective_pam AS ep
+        WHERE ep.type='z' AND ep.target=$zoneid AND pam.id=ep.pam
+        ORDER BY fullname
+    } {
+        lassign [split $fullname /] name
+        set attrs [list $name $application $description]
+        dict set pamapps $id attrs $attrs 
+        dict set pamapps $id name $name
+        dict set pamapps $id output "$fullname|$application|$description"
+    }
+    return $pamapps
+}
+
+proc GetEffectiveCommands { db zoneid } {
+    set commands [dict create]
+    $db eval {
+        SELECT command.id,cmd_name as fullname,cmd,path,form,dzdo_runas,dzsh_runas,keep_env,del_env,add_env,priority,umask,flags,description
+        FROM command,effective_command AS ec
+        WHERE ec.type='z' AND ec.target=$zoneid AND command.id=ec.command
+        ORDER BY fullname
+    } {
+        lassign [split $fullname /] name
+        set attrs [list $name $cmd $path $form $dzdo_runas $dzsh_runas $keep_env $del_env $add_env $priority $umask $flags $description]
+        dict set commands $id attrs $attrs
+        dict set commands $id name $name
+        dict set commands $id output "$fullname|$cmd|$path|$form|$dzdo_runas|$dzsh_runas|$keep_env|$del_env|$add_env|$priority|$umask|$flags|$description"
+    }
+    return $commands
+}
+
+proc GetRolePams { db roleid } {
+    set role_pams {}
+    $db eval {
+        SELECT pam.id,pam.name
+        FROM role_pam,role,pam
+        WHERE role.id=$roleid AND role.id=role_pam.role AND pam.id=role_pam.pam
+        ORDER BY pam.name
+    } {
+        dict set role_pams $id $name
+    }
+    return $role_pams
+}
+
+proc GetRoleCommands { db roleid } {
+    set role_commands {}
+    $db eval {
+        SELECT command.id,command.cmd_name as name
+        FROM role_cmd,role,command
+        WHERE role.id=$roleid AND role.id=role_cmd.role AND command.id=role_cmd.cmd
+        ORDER BY name
+    } {
+        dict set role_commands $id $name
+    }
+    return $role_commands
+}
+
+# We do a mapping of $values using mapping dictionary (id1:id2)
+# Then we make sure the mapped values are unique
+proc MappingReduce { values mapping } {
+    set trans {}
+    foreach v $values {
+        lappend trans [dict get $mapping $v]
+    }
+    return [lsort -unique $trans]
+}
+
+proc GetEffectiveRoles { db zoneid } {
+    set roles [dict create]
+    set pam_id_dict [dict get $::identical_dict pamapps]
+    set command_id_dict [dict get $::identical_dict commands]
+    $db eval {
+        SELECT role.id,name as fullname,timebox,sysrights,description
+        FROM role,effective_role AS er
+        WHERE er.type='z' AND er.target=$zoneid AND role.id=er.role
+        ORDER BY fullname
+    } {
+        lassign [split $fullname /] name
+        set role_pams [GetRolePams $db $id]
+        set role_pams_output [join [dict values $role_pams] ,]
+        set role_pams_transformed [MappingReduce [dict keys $role_pams] $pam_id_dict]
+        
+        set role_commands [GetRoleCommands $db $id]
+        set role_commands_output [join [dict values $role_commands] ,]
+        set role_commands_transformed [MappingReduce [dict keys $role_commands] $command_id_dict]
+        
+        dict set roles $id attrs [list $name $timebox $sysrights $description $role_pams_transformed $role_commands_transformed]
+        dict set roles $id name $name
+        dict set roles $id output "$fullname|$timebox|$sysrights|$description|$role_pams_output|$role_commands_output"
+    }
+    return $roles
+}
+
+proc GetEffectiveAssignments { db zoneid } {
+    global aid
+    set assign_raw {}
+    set assigns {}
+    set role_id_dict [dict get $::identical_dict roles]
+    $db eval {
+        SELECT upn,role.id,role.name
+        FROM aduser,role,effective_assignment AS ea
+        WHERE ea.type='z' AND ea.target=$zoneid AND role.id=ea.role AND aduser.id=ea.aduser
+        ORDER BY upn
+    } {
+        dict set assign_raw $upn $id $name
+    }
+
+    dict for {upn attrs} $assign_raw {
+        incr aid
+        set id_list [dict keys $attrs]
+        set name_list [dict values $attrs]
+        dict set assigns $aid name $upn
+        dict set assigns $aid output "$upn|[join $name_list ,]"
+        dict set assigns $aid attrs [MappingReduce $id_list $role_id_dict]
+    }
+    return $assigns
+}
+
+# Return a dictionary of common keys of dict1, dict2
+# return: dict (common key: 1)
+proc GetCommonKeys { dict1 dict2 } {
+    set common_keys [dict create]
+    dict for {key value} $dict1 {
+        if {[dict exists $dict2 $key]} {
+            dict set common_keys $key 1
+        }
+    }
+    return $common_keys
+}
+
+# diff the two dictionary dict1, dict2
+# first output all the entries only contained in dict1.
+# then output all the entries only contained in dict2.
+# lastly, show the entries with the same key, but different values.
+# - upn:attrs1
+# + upn:attrs2
+proc DiffDict { dict1 dict2 } {
+    global c_remove
+    global c_add
+    set common_keys [GetCommonKeys $dict1 $dict2]
+    PrintLine
+    dict for {key attrs} $dict1 {
+        if { ![dict exists $common_keys $key] } {
+            puts "$c_remove$key|[join $attrs |]"
+        }
+    }
+    PrintLine
+    dict for {key attrs} $dict2 {
+        if { ![dict exists $common_keys $key] } {
+            puts "$c_add$key|[join $attrs |]"
+        }
+    }
+    PrintLine
+    dict for {key -} $common_keys {
+        set attrs1 [dict get $dict1 $key]
+        set attrs2 [dict get $dict2 $key]
+        foreach f1 $attrs1 f2 $attrs2 {
+            if { $f1 != $f2 } {
+                puts "$c_remove$key|[join $attrs1 |]"
+                puts "$c_add$key|[join $attrs2 |]"
+                break
+            }
+        }
+    }
+    PrintLine
+}
+
+proc Output2 { only1_id only2_id common_id all_data1 all_data2 } {
+    global c_remove
+    global c_add
+    PrintLine
+    foreach key $only1_id {
+        puts "$c_remove[dict get $all_data1 $key output]"
+    }
+    PrintLine
+    foreach key $only2_id {
+        puts "$c_add[dict get $all_data2 $key output]"
+    }
+    PrintLine
+    foreach keys $common_id {
+        lassign $keys key1 key2
+        puts "$c_remove[dict get $all_data1 $key1 output]"
+        puts "$c_add[dict get $all_data2 $key2 output]"
+    }
+    PrintLine
+}
+
+proc PrintHeader { text header } {
+    puts "\n$text"
+    puts [join [dict get $::check_headers $header] |]
+}
+
+# This function will do diff of complicated objects, like assignments, roles, pams, commands
+# We will not compare the full name, e.g. role1/zone, since it is usual to have different zone names. We only want to compare the contents.
+# So we will compare the name, e.g. role1, and its attributes.
+# Here is a problem about inheritance. A zone may have many roles named role1, which exist in current and parent zones.
+# For example, zone1 may have three listed roles if zone1 has two level of parents, and zone2 can have two listed roles which has one level of parents.
+# Since all the listed roles are identical (name and attributes), it does not make sense to compare them one by one.
+# Here, we will reduce all the identical roles(pams/commands) into one (with the same set of pams and commands which are reduced as well). 
+# Then we compare them with the other zone.
+# The steps are:
+# 1. get all_data which has the format as the comment in the function
+# 2. Run FindIdentical on the two dict: all_data1, all_data2. It will return a mapping of (<id>: particular id of objects of all identical objects as <id>)
+#    This dictionary is useful for us to identify identical objects. So we will save them for future uses(to determine identical rights when determining identical roles, 
+#    determine identical role assignments using identical roles.)
+# 3. Run Mapping on the ids of all_data, so that we reduce them into unique objects.
+# 4. Run DiffID on the mapping to get rid of identical objects in two zones, and get objects only contained in zone1 and zone2 respectively.
+# 5. Run ConvertNameDict on the results from DiffID. Since different objects can have the same name with different attributes (they are from different parent zones)
+#    and we need to generate a diff using name as the key, so we convert the results into (name:[list of ids with the same name])
+# 6. Run Diff2Output to do the diff. It takes care of the cases like:
+#    zone1 has (role1:1, role1:2, role1:3, role1:4)
+#    zone2 has (role1:4, role1:5)
+#    We will output
+#    ----------------------------------------------
+#    - role1/z1:3   (only contained in zone1 session)
+#    - role1/z2:4   
+#    ----------------------------------------------
+#    (empty only  in zone2 session)
+#    ----------------------------------------------
+#    - role1/z3:1   (in the session with the same keys but different attributes)
+#    + role1/z4:4
+#    - role1/z5:2
+#    + role1/z6:5
+proc Diff2 {db zoneid1 zoneid2 get_object_func text header} {
+    PrintHeader $text $header
+    # all_data = (object id: object_dict)
+    # object_dict = (output:the string representing the object,
+    #                name: the name without zone, e.g. role1
+    #                attrs: list of the attributes of object)
+    set all_data1 [$get_object_func db $zoneid1]
+    set all_data2 [$get_object_func db $zoneid2]
+    # id_identical_dict = (object id of objects from all_data1, all_data2: particular id of objects with the identical attributes)
+    set id_identical_dict [FindIdentical $all_data1 $all_data2]
+    # save maxid_identical_dict to global dictionary identical_dict
+    # identical_dict= (header:id_identical_dict)
+    dict set ::identical_dict $header $id_identical_dict
+    # transformed_dict1 = (particular id of identical objects from all_data1, all_data2:object id)
+    # This step is to get rid of identical objects which is defined in different parent zones.
+    # We only leave one copy of that.
+    set transformed_dict1 [Mapping [dict keys $all_data1] $id_identical_dict]
+    set transformed_dict2 [Mapping [dict keys $all_data2] $id_identical_dict]
+    # only1_list = object id that only contains in all_data1
+    lassign [DiffID $transformed_dict1 $transformed_dict2] only1_list only2_list
+    # only1_dict = (name of object: list of object id)
+    set only1_dict [ConvertNameDict $only1_list $all_data1]
+    set only2_dict [ConvertNameDict $only2_list $all_data2]
+    Diff2Output $only1_dict $only2_dict $all_data1 $all_data2
+}
+
+# It does diff of simple objects. The objects includes users, users with sysrights, and groups
+# The name (upn) is unique for different objects.
+# Objects with the same upn, but different attributes will be listed as:
+# -upn:attrs1
+# +upn:attrs2
+# which will be placed together for easy identication.
+proc Diff {db zoneid1 zoneid2 get_object_func text header} {
+    PrintHeader $text $header
+    set objects1 [$get_object_func $db $zoneid1]
+    set objects2 [$get_object_func $db $zoneid2]
+    DiffDict $objects1 $objects2
+}
+
+# only1: (name:[list of id with the same name])
+# all_data1: (id:<all attributes of object with <id>>)
+# This function does a diff of $only1, $only2
+proc Diff2Output { only1 only2 all_data1 all_data2 } {
+    set only1_id {}
+    set only2_id {}
+    set common_id {}
+    
+    dict for {name olist} $only1 {
+        if { ![dict exists $only2 $name] } {
+            foreach x $olist {
+                lappend only1_id $x
+            }
+        } else {
+            foreach id1 $olist id2 [dict get $only2 $name] {
+                if { $id1 != "" && $id2 != "" } {
+                    lappend common_id [list $id1 $id2]
+                } elseif { $id1 != "" } {
+                    lappend only1_id $id1
+                } else {
+                    lappend only2_id $id2
+                }
+            }
+        }
+    }
+
+    dict for {name olist} $only2 {
+        if { ![dict exists $only1 $name] } {
+            foreach x $olist {
+                lappend only2_id $x
+            }
+        }
+    }
+    Output2 $only1_id $only2_id $common_id $all_data1 $all_data2
+}
+
+# Find the maximum value in $values
+proc FindMax { values } {
+    if { [llength $values] == 0 } {
+        return
+    }
+    set max [lindex $values 0]
+    foreach v $values {
+        if { $v > $max } {
+            set max $v
+        }
+    }
+    return $max
+}
+
+# Use addbload to load the whole tree data into sqlite3 database $db
+proc LoadZone {db dbpath zones} {
+    make_db $dbpath $db
+    foreach zone $zones {
+        load_root $zone $db
+    }
+    explode $db
+}
+
+# This function generate a mapping.
+# args is usually two dicts, dict1, dict2.
+# dict format: (<id>:attrs:<attrs>)
+# The output would be: (<id>: a particular id in the set of identical objects as <id>)
+proc FindIdentical { args } {
+    set attrdict {}
+    set id_dict {}
+    foreach objects $args {
+        dict for {key values} $objects {
+            set attrs [dict get $values attrs]
+            if { ![dict exists $attrdict $attrs] } {
+                dict set attrdict $attrs $key
+            }
+            set id_key [dict get $attrdict $attrs]
+            dict set id_dict $key $id_key
+        }
+    }
+    return $id_dict
+}
+
+# objects: list of ids
+# mapping: (id1:id2)
+# return dict (id mapped using mapping: max id of the set of objects which mapped to the same id)
+# choosing max because the object will be lower in the tree, which is closer to the zone being compared.
+proc Mapping { objects mapping } {
+    set transformed {}
+    set temp {}
+    foreach o $objects {
+        dict lappend temp [dict get $mapping $o] $o
+    }
+    dict for {key id_list} $temp {
+        dict set transformed $key [FindMax $id_list]
+    }
+    return $transformed
+}
+
+# find values only contained in object_dict1 and object_dict2
+# return 2 lists: only1, objects in object_dict1 only
+#                 only2, objects in object_dict2 only
+proc DiffID { object_dict1 object_dict2 } {
+    set only1 {}
+    set only2 {}
+    dict for {key value} $object_dict1 {
+        if { ![dict exists $object_dict2 $key] } {
+            dict set only1 $key $value
+        }
+    }
+    
+    dict for {key value} $object_dict2 {
+        if { ![dict exists $object_dict1 $key] } {
+            dict set only2 $key $value
+        }
+    }
+    return [list [dict values $only1] [dict values $only2]]
+}
+
+# object_list: a list of id
+# all_data: dictionary (<id>:name:<name>)
+# we transform object_list into dictionary (name:[list of object id with the same name])
+proc ConvertNameDict { object_list all_data } {
+    set transformed {}
+    foreach value $object_list {
+        dict lappend transformed [dict get $all_data $value name] $value 
+    }
+    return $transformed
+}
+
+################ execute start ##########################
+### ------ options setting ------
+set scriptPath [file normalize [info script]]
+set scriptDir [file dirname $scriptPath]
+set addbloader "$scriptDir/addbloader"
+
+if {[getopt argv -config bindconfig] == 0 } {
+    usage "Missing bind domains config file" 
+}
+
+foreach opt {users groups privileges} {
+    set $opt [getopt argv -$opt]
+}
+
+set verbose [getopt argv -v]
+set unified [getopt argv -u]
+
+if { $unified } {
+    lassign {+ -} c_add c_remove
+} else {
+    lassign {> <} c_add c_remove
+}
+
+if {$users == 0 && $groups == 0 && $privileges == 0} {
+    # all are zeros, means migrate all.
+    lassign {1 1 1} users groups privileges
+}
+
+if {[llength $argv] != 2} {
+    usage "Please enter <dn of zone1> and <dn of zone2>."
+}
+
+lassign $argv zone1 zone2
+
+if {[string match -nocase $zone1 $zone2]} {
+    ErrorExit "The both zones are identical!"
+}
+
+### ------ param ------
+# zone's domains are all bind 
+source $bindconfig
+source $addbloader
+
+if { [catch {slz $zone1} msg] } {
+    puts "Zone1($zone1) error: $msg"
+    exit 1
+}
+if { [catch {slz $zone2} msg] } {
+    puts "Zone2($zone2) error: $msg"
+    exit 1
+}
+
+LoadZone db "[get_temp_dir]/zones.db" [list $zone1 $zone2]
+set zoneid1 [db onecolumn {select id from zone where path=$zone1}]
+set zoneid2 [db onecolumn {select id from zone where path=$zone2}]
+
+if { $::verbose } {
+    PrintLine
+}
+
+if { $users } {
+    if { $privileges } {
+        Diff db $zoneid1 $zoneid2 GetEffectiveUsersSysrights Users users_sysrights
+    } else {
+        Diff db $zoneid1 $zoneid2 GetEffectiveUsers Users users
+    }
+}
+
+if { $groups } {
+    Diff db $zoneid1 $zoneid2 GetEffectiveGroups Groups groups
+}
+
+if { $privileges } {
+    Diff2 db $zoneid1 $zoneid2 GetEffectivePamapps "Pam Applications" pamapps
+    Diff2 db $zoneid1 $zoneid2 GetEffectiveCommands "Commands" commands
+    Diff2 db $zoneid1 $zoneid2 GetEffectiveRoles "Roles" roles
+    Diff2 db $zoneid1 $zoneid2 GetEffectiveAssignments "Role Assignments" assignments
+}
+
+################ execute end ##########################

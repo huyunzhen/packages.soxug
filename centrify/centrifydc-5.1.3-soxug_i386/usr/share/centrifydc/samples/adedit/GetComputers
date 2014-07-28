@@ -1,0 +1,34 @@
+#!/bin/env adedit
+
+# GetComputers
+# Purpose: Retrieves a listing of all UNIX computers in all Centrify Zones.
+ 
+package require ade_lib 
+
+puts "
+This script retrieves a listing of all UNIX computers in the specified domain"
+puts "and shows the zone to which it is joined"
+
+if { $argc == 0 } {
+	puts "
+	Command format: $argv0 domain name"
+ 	exit 1
+ }
+
+
+set domain [lindex $argv 0]
+# Use lindex command because argv is a list and bind requires a string
+
+puts "
+Enter administrator name for bind command"
+gets stdin admin
+
+bind $domain $admin
+
+foreach ZONE [get_zones $domain] {
+	select_zone $ZONE
+	foreach COMPUTER [get_zone_computers] {
+		puts -nonewline $COMPUTER:; puts $ZONE;
+	}
+  }
+ 

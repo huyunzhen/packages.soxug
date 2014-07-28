@@ -1,0 +1,31 @@
+#!/bin/sh
+#
+# Frontend to perl; searches the path for the perl binary, since it's
+# in different places on different systems.  This allows us to use the
+# same #! line on all the systems we support, regardless of where the
+# perl binary is located.  The only requirement is that a bourne-shell
+# compatible shell be installed in /bin/sh.
+#
+PERL_DIRS="/bin /usr/bin /usr/local/bin /opt/bin /opt/perl/bin /opt/perl5/bin"
+
+for dir in `(IFS=:; set -- $PATH; echo "$@")` $PERL_DIRS
+do
+    # If this file is a plain executable, we found it.
+    if [ -x "$dir/perl" -a -f "$dir/perl" ]
+    then
+	# Some systems have a broken perl earlier in the path;
+	# test this one to make sure it works.
+	if "$dir/perl" -e 'use 5.008;' > /dev/null 2>&1
+	then
+	    perl="$dir/perl"
+	    break
+	fi
+    fi
+done
+
+if [ "$perl" = "" ]
+then
+    echo "$0: Cannot find perl binary." >&2
+    exit 1
+fi
+exec "$perl" "$@"

@@ -1,0 +1,52 @@
+#!/bin/bash
+PATH=/usr/share/centrifydc/kerberos/bin:$PATH
+KRB5CCFILE=`echo $KRB5CCNAME | sed "s/FILE://g"`
+if [ -z "$KRB5CCNAME" ] || [ ! -f "$KRB5CCFILE" ]; then
+    if [ -z "$UID" ]; then
+        UID=`/usr/share/centrifydc/bin/adid -u`
+        export UID
+    fi
+    KRB5CCFILE=/tmp/krb5cc_$UID
+    # If there is more than one, choose the newest krb5 cache file owned 
+    # by this user, note if none exists, we end up with krb5cc_$UID
+    for f in `find /tmp -user $UID -name krb5cc\*`
+    do        
+        klist -c -s $KRB5CCFILE > /dev/null 2>&1 
+        if [ ! $? -o $f -nt $KRB5CCFILE ]; then
+            KRB5CCFILE=$f
+        fi
+    done 2> /dev/null    
+    KRB5CCNAME=FILE:$KRB5CCFILE
+    export KRB5CCNAME
+fi
+if [ -z "$CDC_JOINED_ZONE" ]; then
+    # CDC_JOINED_ZONE=`adinfo -Z` 3.3 only..
+    CDC_JOINED_ZONE=`cat /var/centrifydc/kset.zonename`
+    export CDC_JOINED_ZONE
+fi
+if [ -z "$CDC_LOCALHOST" ]; then
+    CDC_LOCALHOST=`adinfo -n`
+    export CDC_LOCALHOST
+fi
+if [ -z "$CDC_JOINED_SITE" ]; then
+    CDC_JOINED_SITE=`adinfo -s`
+    export CDC_JOINED_SITE
+fi
+if [ -z "$CDC_JOINED_DOMAIN" ]; then
+    CDC_JOINED_DOMAIN=`adinfo -d`
+    export CDC_JOINED_DOMAIN
+fi
+if [ -z "$CDC_JOINED_DC" ]; then
+    CDC_JOINED_DC=`adinfo -r`
+    export CDC_JOINED_DC
+fi
+if [ -z "$USER_PRINCIPAL_NAME" ] && [ -f "$KRB5CCFILE" ]; then
+    USER_PRINCIPAL_NAME=`klist 2>/dev/null | grep 'Default principal' | awk '{ print $3 }'`
+    export USER_PRINCIPAL_NAME
+fi
+if [ "`uname`" = "AIX" ]; then
+    if [ -z "$AUTHSTATE" ]; then
+        AUTHSTATE=CENTRIFYDC
+        export AUTHSTATE
+    fi
+fi

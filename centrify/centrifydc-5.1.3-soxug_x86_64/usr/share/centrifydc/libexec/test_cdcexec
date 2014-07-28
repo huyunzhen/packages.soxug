@@ -1,0 +1,24 @@
+#! /bin/sh
+
+VARS="LD_LIBRARY_PATH \
+      LD_LIBRARY_PATH_32 \
+      LD_LIBRARY_PATH_64 \
+      LIBPATH SHLIB_PATH \
+      LD_LIBRARYN32_PATH \
+      LD_LIBRARY64_PATH \
+      DYLD_LIBRARY_PATH \
+      DYLD_FALLBACK_LIBRARY_PATH"
+
+echo
+echo Runtime Library Path
+echo ====================
+PAT=""
+for VAR in $VARS; do
+    if [ "$PAT" = "" ]; then
+        PAT="$VAR"
+    else
+        PAT="$PAT|$VAR"
+    fi
+done
+set | egrep "^($PAT)"
+echo

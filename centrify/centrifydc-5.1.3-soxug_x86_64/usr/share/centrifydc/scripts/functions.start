@@ -1,0 +1,589 @@
+#!/bin/sh
+#
+# Centrify DirectControl
+#
+#
+# Description:  Common Functions for init scripts of Centrify DirectControl
+#
+# Copyright (C) 2004-2014 Centrify Corporation. All rights reserved.
+# All rights reserved.
+#
+
+SERVICE=${SERVICE:-centrifydc}
+PROG=${PROG:-adclient}
+
+# Identify operating system
+identify_operating_system() {
+    # Variable must be initialized outside of case, or bash will
+    # initialize it as a local (bash bug).
+    TARGET_OS=""
+    ECHO=""
+    UNAME=`uname`
+
+    case "$UNAME" in
+        AIX*)      
+            TARGET_OS="aix"
+            ;;
+        HP-UX*)     
+            TARGET_OS="hpux"
+            ;;
+        SunOS*)  
+            TARGET_OS="solaris"
+            ;;
+        Linux*)    
+            TARGET_OS="linux"
+            ;;
+        Darwin*)    
+            TARGET_OS="darwin"
+            ;;
+        IRIX*)
+            TARGET_OS="irix"
+            ;;
+        *)  echo "Error: Unrecognized System ($UNAME)."
+            exit 1
+            ;;
+    esac
+
+    if echo -e | grep -- "^-e" > /dev/null 2>&1; then
+        ECHO="echo"
+    else
+        ECHO="echo -e"
+    fi
+
+    export   TARGET_OS
+    export   ECHO
+}
+
+# Get uid
+get_uid() {
+    if [ -z "$UID" ]; then
+        UID=`${ID} | ${SED} -e 's/uid=//' -e 's/(.*$//'`
+        export UID
+    fi
+}
+
+# Get pids
+get_pids() {
+    PIDS=""
+    if [ -n "$1" ]; then
+
+        case "$TARGET_OS" in
+            aix*)
+                PIDS=`$1 | ${GREP} active |
+                ${AWK} '{print $2}'`
+                ;;
+            *)
+                RUN_RESULT="`$1 2> /dev/null`"
+                [ $? -ne 0 ] && return
+                # exit code of upstart is always 0 if service exists
+                # grep 'running' to see whether it is running
+                [ "$SERVICE_MANAGER" = "upstart" -a -z "`echo \"$RUN_RESULT\" | grep running`" ] && return
+                
+                if [ "$SERVICE_MANAGER" = "systemd" ]; then
+                    PIDS=`echo "$RUN_RESULT" | ${GREP} 'Main PID:' | 
+                    ${SED} -e 's/.*Main PID: //' -e 's/ (.*//'`
+                elif [ "$SERVICE_MANAGER" = "upstart" ]; then
+                    PIDS=`echo "$RUN_RESULT" | ${GREP} running | 
+                    ${SED} -e 's/^.*process //'`
+                else
+                    PIDS=`echo "$RUN_RESULT" | ${GREP} running |
+                    ${SED} -e 's/^.*(pid //' -e 's/).*$//'`
+                fi
+                ;;
+        esac
+    fi
+}
+
+#
+# Get the pid from the pid file, and verify it with ps.
+# This only works on systems with a ps that supports the
+# POSIX -o option.
+#
+pidfile_status() {
+    if [ -f /var/run/${PROG}.pid ]
+    then
+        local pid=`${CAT} /var/run/${PROG}.pid`
+        local command=`${PS} -o command= -p $pid 2> /dev/null`
+        case "$command" in
+            *${PROG}*)
+                echo "${NAME} (pid $pid) is running..."
+                ;;
+
+            *)
+                echo "${NAME} is stopped"
+                ;;
+        esac
+    fi
+}
+
+#
+# Kill a process and wait for it to terminate.
+#
+kill_process ()
+{
+    ps -ax -opid,ucomm | while read pid command
+    do
+        case "$command" in
+            $1)
+                kill $pid >& /dev/null
+                #
+                # Lets try and wait for the mappers to finish
+                #
+                timeout=0
+                while ps -p $pid | grep "$1" >& /dev/null
+                do
+                    if [ "$timeout" -eq 20 ]; then
+                        kill -KILL $pid >& /dev/null
+                        break
+                    else
+                        sleep 1
+                        let timeout++
+                    fi
+                done
+            ;;
+        esac
+    done
+}
+
+#
+# Stop and wait until service is stopped completely.
+#
+stop_and_wait() {
+    RETVAL=0
+
+    # Get PIDS of adclient
+    get_pids "$STATUS_CMD"
+
+    $STOP_CMD > /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        if [ "$TARGET_OS" = "aix" ]; then
+            
+            # Wait for 30sec until the service stops, like adleave does. 
+            DELAYTIMES=30
+            
+            while [ $DELAYTIMES -gt 0 ]; do
+                # If service is stopping, then wait for a while.
+                $STATUS_CMD | ${GREP} stopping > /dev/null 2>&1
+                [ $? -eq 0 ] || break
+                
+                DELAYTIMES=`expr $DELAYTIMES - 1`
+                # If service still can't be stopped, then force to stop it.
+                if [ $DELAYTIMES -eq 0 -a -n "$PIDS" ]; then
+                    # Get the process tree which will include the PID of
+                    # the watchdog. We have to kill the watchdog at the
+                    # same time otherwise it will restart adclient.
+                    TREE_PIDS=`ps -T $PIDS | ${AWK} 'NR>1 {print $1}'`
+                    [ -n "$TREE_PIDS" ] && \
+                        kill -KILL $TREE_PIDS > /dev/null 2>&1
+                fi
+
+                sleep 1
+            done
+        fi
+    else
+        RETVAL=1
+    fi
+    return $RETVAL
+}
+
+#
+# Rename any core files to include a date stamp.
+#
+save_core_file() {
+    if [ "$PROG" = "adclient" ]; then
+        if [ -f /var/centrifydc/core ]; then
+            mv /var/centrifydc/core /var/centrifydc/core.`date '+%Y-%d-%b-%T'`
+        fi
+    fi
+}
+
+#
+# A svcadm 'wrapper' functions to workaround a bug in svcadm on
+# Solaris 11 Express.
+#
+# When 'svcadm disable' is run with the '-s' option and the
+# service cannot stop within the timeout period, it does not
+# return until someone clear the maintenance state to disable.
+#
+# So, we no longer use '-s' for svcadm, we have to run svcadm
+# and wait until the service state is changed. This wrapper is
+# simulating the '-s' behavior.
+#
+svcadm_wait() {
+    SWAIT_RC=0
+    case "$1" in
+        enable|disable)
+            SWAIT_TASK="$1"
+            shift
+            SWAIT_OPTS=""
+            if [ "$SWAIT_TASK" = "enable" ]; then
+                SWAIT_TARGET_STATE="online"
+            else
+                # disable
+                SWAIT_TARGET_STATE="disabled"
+            fi
+            # Possible stable states (see smf(5))
+            SWAIT_END_STATES="maintenance degraded $SWAIT_TARGET_STATE"
+            case "$1" in
+                -*)
+                    SWAIT_OPTS="$1"
+                    shift
+                    ;;
+            esac
+            # Currently we only accept 1 service
+            if [ $# -ne 1 ]; then
+                SWAIT_RC=2
+            else
+                SWAIT_SERVICE="$1"
+                SWAIT_INIT_STATE=`svcadm_get_state $SWAIT_SERVICE`
+
+                # Whether 'maintenance' state will affect the
+                # task is still unknown. Sometimes we can 'enable'
+                # the service to 'online' and clear the 'maintenance'
+                # state, sometimes we cannot.
+                #
+                # For our use cases, we don't really care about
+                # the 'maintenance' state. Just clear it to ensure
+                # the task can be done.
+                #
+                if [ "$SWAIT_INIT_STATE" = "maintenance" ]; then
+                    /usr/sbin/svcadm clear $SWAIT_SERVICE
+                fi
+                SWAIT_INIT_STATE=`svcadm_get_state $SWAIT_SERVICE`
+
+                /usr/sbin/svcadm $SWAIT_TASK $SWAIT_OPTS $SWAIT_SERVICE
+                SWAIT_RC=$?
+
+                if [ "$SWAIT_RC" -eq 0 -a \
+                    "$SWAIT_TARGET_STATE" != "$SWAIT_INIT_STATE" ]; then
+
+                    SWAIT_STATE=`svcadm_get_state $SWAIT_SERVICE`
+                    while echo "$SWAIT_END_STATES" | \
+                        grep -vw "$SWAIT_STATE" > /dev/null ; do
+                        sleep 1
+                        SWAIT_STATE=`svcadm_get_state $SWAIT_SERVICE`
+                    done
+
+                    # Check final state
+                    if [ "$SWAIT_STATE" = "maintenance" ]; then
+                        # Problem occurred, assume this is a problem with
+                        # the service instance itself.
+                        echo "svcadm: Instance \"`svcadm_get_fmri $SWAIT_SERVICE`\" is in maintenance state." >&2
+                        SWAIT_RC=3
+                    fi
+                fi
+            fi
+            ;;
+        *)
+            # Unknown task, by-pass this function
+            /usr/sbin/svcadm "$@"
+            SWAIT_RC=$?
+            ;;
+    esac
+
+    return $SWAIT_RC
+}
+
+#
+# Get service current state.
+#
+svcadm_get_state()
+{
+    # Get nstate as well to avoid getting the '*' in state,
+    # use awk to get the state only
+    /usr/bin/svcs -H -o state,nstate $1 | awk '{ print $1 }'
+}
+
+#
+# Get service FMRI.
+#
+svcadm_get_fmri()
+{
+    /usr/bin/svcs -H -o fmri $1
+}
+
+
+prepare_cmds() 
+{
+    # Assign commands for this platform
+    # Variable must be initialized outside of case, or bash will
+    # initialize it as a local (bash bug).
+    REFRESH_CMD=""
+    PASS_OPTIONS=1
+    SERVICE_MANAGER=""
+    START_CMD=""
+    STOP_CMD=""
+    RESTART_CMD=""
+    CONDRESTART_CMD=""
+    STATUS_CMD=""
+
+    DISABLE_CMD=""
+    REFRESH_CMD=""
+    CLEAR_CMD=""
+
+    FLUSH_CMD=""
+    INFO_CMD=""
+    ID=""
+    GREP=""
+    SED=""
+    CAT=""
+    SVC="/lib/svc/bin/svc.startd"
+
+    case "$TARGET_OS" in
+        linux*)
+            if systemctl show-environment > /dev/null 2>&1; then # if systemd is running
+                SERVICE_MANAGER="systemd"
+                START_CMD="/bin/systemctl start ${SERVICE}.service"
+                STOP_CMD="/bin/systemctl stop ${SERVICE}.service"
+                RESTART_CMD="/bin/systemctl restart ${SERVICE}.service"
+                CONDRESTART_CMD="/bin/systemctl restart ${SERVICE}.service"
+                STATUS_CMD="/bin/systemctl status ${SERVICE}.service"
+                PASS_OPTIONS=0
+            elif [ -f "/etc/init/${SERVICE}.conf" ] && \
+                initctl version > /dev/null 2>&1; then # if service file exist and upstart is running
+                SERVICE_MANAGER="upstart"
+                START_CMD="/sbin/initctl start ${SERVICE}"
+                STOP_CMD="/sbin/initctl stop ${SERVICE}"
+                RESTART_CMD="/sbin/initctl restart ${SERVICE}"
+                CONDRESTART_CMD="/sbin/initctl restart ${SERVICE}"
+                STATUS_CMD="/sbin/initctl status ${SERVICE}"
+                PASS_OPTIONS=0
+            else
+                START_CMD="/etc/init.d/${SERVICE} start"
+                STOP_CMD="/etc/init.d/${SERVICE} stop"
+                RESTART_CMD="/etc/init.d/${SERVICE} restart"
+                CONDRESTART_CMD="/etc/init.d/${SERVICE} restart"
+                STATUS_CMD="/etc/init.d/${SERVICE} status"
+            fi
+            #
+            FLUSH_CMD="/usr/sbin/adflush"
+            INFO_CMD="/usr/bin/adinfo"
+            ID="/usr/bin/id"
+            GREP="/bin/grep"
+            SED="/bin/sed"
+            ;;
+        solaris*)
+            if [ -x "$SVC" ]; then
+                START_CMD="svcadm_wait enable ${SERVICE}"
+                STOP_CMD="svcadm_wait disable -t ${SERVICE}"
+                DISABLE_CMD="svcadm_wait disable ${SERVICE}"
+                RESTART_CMD="/usr/sbin/svcadm restart ${SERVICE}"
+                CONDRESTART_CMD="/usr/sbin/svcadm restart ${SERVICE}"
+                REFRESH_CMD="/usr/sbin/svcadm refresh ${SERVICE}"
+                CLEAR_CMD="/usr/sbin/svcadm clear ${SERVICE}"
+                # svcadm don't pass command arguments to sub systems
+                PASS_OPTIONS=0
+            else
+                START_CMD="/etc/init.d/${SERVICE} start"
+                STOP_CMD="/etc/init.d/${SERVICE} stop"
+                DISABLE_CMD="$STOP_CMD"
+                RESTART_CMD="/etc/init.d/${SERVICE} restart"
+                CONDRESTART_CMD="/etc/init.d/${SERVICE} restart"
+            fi
+            STATUS_CMD="/etc/init.d/${SERVICE} status"
+            #
+            FLUSH_CMD="/usr/sbin/adflush"
+            INFO_CMD="/usr/bin/adinfo"
+            ID="/usr/bin/id"
+            GREP="/usr/bin/grep"
+            SED="/usr/bin/sed"
+            ;;
+        hpux*)
+            START_CMD="/sbin/init.d/${SERVICE} start"
+            STOP_CMD="/sbin/init.d/${SERVICE} stop"
+            RESTART_CMD="/sbin/init.d/${SERVICE} restart"
+            CONDRESTART_CMD="/sbin/init.d/${SERVICE} restart"
+            STATUS_CMD="/sbin/init.d/${SERVICE} status"
+            #
+            FLUSH_CMD="/usr/sbin/adflush"
+            INFO_CMD="/usr/bin/adinfo"
+            ID="/usr/bin/id"
+            GREP="/usr/bin/grep"
+            SED="/usr/bin/sed"
+            ;;
+        aix*)
+            START_CMD="/usr/bin/startsrc -e LIBPATH=/usr/share/centrifydc/lib:/usr/share/centrifydc/kerberos/lib -s ${SERVICE}"
+            STOP_CMD="/usr/bin/stopsrc -s ${SERVICE}"
+            RESTART_CMD=$START_CMD
+            CONDRESTART_CMD=$RESTART_CMD
+            STATUS_CMD="/usr/bin/lssrc -s ${SERVICE}"
+            #
+            FLUSH_CMD="/usr/sbin/adflush"
+            INFO_CMD="/usr/bin/adinfo"
+            ID="/usr/bin/id"
+            GREP="/usr/bin/grep"
+            SED="/usr/bin/sed"
+            AWK="/usr/bin/awk"
+            ;;
+        darwin*)
+            START_CMD="/bin/launchctl load   -w /Library/LaunchDaemons/com.centrify.${PROG}.plist"
+            STOP_CMD="/bin/launchctl  unload /Library/LaunchDaemons/com.centrify.${PROG}.plist"
+            DISABLE_CMD="/bin/launchctl  unload -w /Library/LaunchDaemons/com.centrify.${PROG}.plist"
+            RESTART_CMD="eval /bin/launchctl unload -w /Library/LaunchDaemons/com.centrify.${PROG}.plist; /bin/launchctl load -w /Library/LaunchDaemons/com.centrify.${PROG}.plist"
+            CONDRESTART_CMD=$RESTART_CMD
+            STATUS_CMD="pidfile_status"
+            #
+            FLUSH_CMD="/usr/sbin/adflush"
+            INFO_CMD="/usr/bin/adinfo"
+            ID="/usr/bin/id"
+            GREP="/usr/bin/grep"
+            SED="/usr/bin/sed"
+            CAT="/bin/cat"
+            PS="/bin/ps"
+            ;;
+        irix*)
+            START_CMD="/etc/init.d/${SERVICE} start"
+            STOP_CMD="/etc/init.d/${SERVICE} stop"
+            RESTART_CMD="/etc/init.d/${SERVICE} restart"
+            CONDRESTART_CMD="/etc/init.d/${SERVICE} restart"
+            STATUS_CMD="/etc/init.d/${SERVICE} status"
+            #
+            FLUSH_CMD="/usr/sbin/adflush"
+            INFO_CMD="/usr/bin/adinfo"
+            ID="/usr/bin/id"
+            GREP="/sbin/grep"
+            SED="/sbin/sed"
+            ;;
+        *)
+            $ECHO "Not implement yet, please fix me!"
+            exit 1;
+            ;;
+    esac 
+}
+
+start_service()
+{
+    if [ "$RUNNING" -eq "1" ]; then
+        $ECHO "${NAME} is already running (pid ${PIDS})."
+    else
+        if [ "$UID" -eq "0" ]; then
+            save_core_file
+            if [ "$TARGET_OS" = "aix" ]; then
+                $START_CMD -a "$*" > /dev/null 2>&1
+            elif [ "$TARGET_OS" = "solaris" ] ; then
+                $REFRESH_CMD > /dev/null 2>&1
+                $START_CMD $CMD_OPTIONS > /dev/null 2>&1
+                if [ -x "$SVC" ] ; then
+                    STATE=`/usr/bin/svcs -H -o state ${SERVICE}`
+                    if [ "$STATE" = "maintenance" ]; then
+                        $CLEAR_CMD > /dev/null 2>&1
+                    fi
+                fi
+            else
+                $START_CMD $CMD_OPTIONS > /dev/null 2>&1
+            fi
+            RETVAL=$?
+            if [ $RETVAL -eq 0 ]; then
+                $ECHO "${NAME} started."
+            else
+                $ECHO "Fail to start ${NAME}."
+            fi
+        else
+            $ECHO "Root privilege is required to start ${NAME}."
+            RETVAL=1
+        fi
+    fi
+}
+
+stop_service()
+{
+    if [ "$RUNNING" -ne "1" ]; then
+            $ECHO "${NAME} is not running."
+    else
+        if [ "$UID" -eq "0" ]; then
+            if [ "$TARGET_OS" = "aix" ]; then
+                stop_and_wait
+            else
+                $STOP_CMD $CMD_OPTIONS > /dev/null 2>&1
+            fi
+            if [ "$TARGET_OS" = "darwin" ] ; then
+                kill_process ${PROG}
+            fi
+            RETVAL=$?
+            if [ $RETVAL -eq 0 ]; then
+                $ECHO "${NAME} stopped."
+            else
+                $ECHO "Fail to stop ${NAME}."
+            fi
+        else
+            $ECHO "Root privilege is required to stop ${NAME}."
+            RETVAL=1
+        fi
+    fi
+}
+
+restart_service()
+{
+    if [ "$UID" -eq "0" ]; then
+        save_core_file
+        if [ "$TARGET_OS" = "aix" -o \
+             "$TARGET_OS" = "darwin" -o \
+             "$TARGET_OS" = "solaris" ]; then
+            stop_service > /dev/null 2>&1
+
+            # update the var for start_service 
+            RUNNING=0
+            get_pids "$STATUS_CMD"
+            [ -n "$PIDS" ] && RUNNING=1
+
+            start_service > /dev/null 2>&1
+        elif [ "$SERVICE_MANAGER" = "upstart" ]; then
+            $STOP_CMD $CMD_OPTIONS > /dev/null 2>&1
+            $START_CMD $CMD_OPTIONS > /dev/null 2>&1
+            RETVAL=$?
+        else
+            $RESTART_CMD $CMD_OPTIONS > /dev/null 2>&1
+            RETVAL=$?
+        fi            
+        if [ $RETVAL -eq 0 ]; then
+            $ECHO "${NAME} restarted."
+        else
+            $ECHO "Fail to restart ${NAME}."
+        fi
+    else
+        $ECHO "Root privilege is required to restart ${NAME}."
+        RETVAL=1
+    fi
+}
+
+condrestart_service()
+{
+    if [ "$RUNNING" -ne "1" ]; then
+        $ECHO "${NAME} is not running."
+    else
+        if [ "$UID" -eq "0" ]; then
+            if [ "$TARGET_OS" = "aix" -o \
+                 "$TARGET_OS" = "darwin" -o \
+                 "$TARGET_OS" = "solaris" ]; then
+                stop_service > /dev/null 2>&1
+
+                # update the var for start_service 
+                RUNNING=0
+                get_pids "$STATUS_CMD"
+                [ -n "$PIDS" ] && RUNNING=1
+
+                start_service > /dev/null 2>&1
+            else
+                $CONDRESTART_CMD $CMD_OPTIONS > /dev/null 2>&1
+                RETVAL=$?
+            fi
+            if [ $RETVAL -eq 0 ]; then
+                $ECHO "${NAME} restarted."
+            else
+                $ECHO "Fail to restart ${NAME}."
+            fi
+        else
+            $ECHO "Root privilege is required to restart ${NAME}."
+            RETVAL=1
+        fi
+    fi
+}
+
+status_service()
+{
+    if [ "$RUNNING" -eq "1" ]; then
+        $ECHO "${NAME} is running (pid ${PIDS})."
+    else
+        $ECHO "${NAME} is not running."         
+    fi
+}

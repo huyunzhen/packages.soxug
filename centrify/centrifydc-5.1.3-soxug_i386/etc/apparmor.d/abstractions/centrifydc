@@ -1,0 +1,13 @@
+#    Copyright (C) 2006 Centrify Corp.  All Rights Reserved.
+#
+# AppArmor config file for any program which uses DirectControl (nss or pam).  
+# Should be installed in /etc/apparmor.d/abstraction and included in
+# the following files:
+#            /etc/apparmor.d/abstractions/authentication
+#            /etc/apparmor.d/abstractions/nameservice
+#
+  /var/centrifydc/daemon  rw,
+  /var/centrifydc/daemon2  rw,
+  /etc/centrifydc/*  r,
+  /proc/*/stat  r,
+

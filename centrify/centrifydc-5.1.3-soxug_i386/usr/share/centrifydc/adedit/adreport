@@ -1,0 +1,180 @@
+#!/bin/sh
+#
+# $Change: 108300 $
+# $Revision: #1 $
+# $DateTime: 2014/01/20 12:11:06 $
+#
+# the next line restarts using tclsh \
+exec adedit "$0" "$@"
+package require ade_lib
+package require sqlite3
+
+proc usage {} {
+    puts {usage: adreport.tcl -db <db path> -report user | computer | command | assignment | special_assignment | effective_assignment | role | effective_role [-filter <filter>] [-sep csv | tab | <char>]}
+    puts {    use special_assignment to get all role assignments for "All AD Users" (principal_type: 'a'), "All local UNIX accounts" (principal_type: 'x'), "Local UNIX User" (principal_type: '#') and "Local UNIX Group" (principal_type: '%')}
+    exit 1
+}
+
+proc user_report {filter sep} {
+    set title [list "user_principal_name" "computer_dns_name" "uname" "uid"]
+    puts [join $title $sep]
+    puts "----------------------------------------------------------------"
+    db1 eval {
+        SELECT computer.dnsname,aduser.upn,uid,uname,passflag
+        FROM computer,aduser,effective_user as eu
+        WHERE eu.type='c' AND computer.id = eu.target AND aduser.id=eu.aduser
+        AND aduser.upn LIKE $filter ORDER BY aduser.upn
+    } {
+        set l [list $upn $dnsname $uname $uid]
+        puts [join $l $sep]
+    }
+}
+
+proc computer_report {filter sep} {
+    set title [list "computer_dns_name" "user_principal_name" "uname" "uid"]
+    puts [join $title $sep]
+    puts "----------------------------------------------------------------"
+    db1 eval {
+        SELECT computer.dnsname,aduser.upn,uid,uname,passflag
+        FROM computer,aduser,effective_user as eu
+        WHERE eu.type='c' AND computer.id=eu.target AND aduser.id=eu.aduser
+        AND computer.dnsname LIKE $filter ORDER BY computer.dnsname
+    } {
+        set l [list $dnsname $upn $uname $uid]
+        puts [join $l $sep]
+    }
+}
+
+proc command_report {filter sep} {
+    set title [list "cmd_name" "role_name" "cmd_description" "cmd" "path" "form" "dzdo_runas" "dzsh_runas" "keep_env" "del_env" "add_env" "priority" "umask" "flags"]
+    puts [join $title $sep]
+    puts "----------------------------------------------------------------"
+    db1 eval {
+        SELECT cmd_name,role.name,command.description,command.cmd,path,form,dzdo_runas,dzsh_runas,keep_env,
+               del_env,add_env,priority,umask,flags 
+        FROM command,role,role_cmd
+        WHERE role_cmd.cmd=command.id and role_cmd.role=role.id AND cmd_name LIKE $filter
+        ORDER BY cmd_name
+    } {
+        set l [list $cmd_name $name $description $cmd $path $form $dzdo_runas $dzsh_runas $keep_env $del_env $add_env $priority $umask $flags]
+        puts [join $l $sep]
+    }
+}
+
+proc assignment_report {filter sep} {
+    set title [list "user_principal_name" "principal_type" "role_name" "zone_name" "crole_name"]
+    puts [join $title $sep]
+    puts "----------------------------------------------------------------"
+    db1 eval {
+        SELECT assignment.principal_type, role.name as role_name, assignment.principal, zone.name as zone_name, crole.name as crole_name 
+        FROM assignment, role, zone LEFT JOIN crole ON (assignment.crole=crole.id) 
+        WHERE assignment.role=role.id AND assignment.zone=zone.id AND assignment.principal LIKE $filter
+        ORDER BY assignment.principal
+    } {
+        set l [list $principal $principal_type $role_name $zone_name $crole_name]
+        puts [join $l $sep]
+    }
+}
+
+proc special_assignment_report {filter sep} {
+    set title [list "user_principal_name" "principal_type" "role_name" "zone_name" "crole_name"]
+    puts [join $title $sep]
+    puts "----------------------------------------------------------------"
+    db1 eval {
+        SELECT assignment.principal_type, role.name as role_name, assignment.principal, zone.name as zone_name, crole.name as crole_name 
+        FROM assignment, role, zone LEFT JOIN crole ON (assignment.crole=crole.id) 
+        WHERE (assignment.principal_type='a' OR assignment.principal_type='x' OR assignment.principal_type='#' OR assignment.principal_type='%') AND assignment.role=role.id AND assignment.zone=zone.id AND assignment.principal LIKE $filter
+        ORDER BY assignment.principal
+    } {
+        set l [list $principal $principal_type $role_name $zone_name $crole_name]
+        puts [join $l $sep]
+    }
+}
+
+proc effective_assignment_report {filter sep} {
+    set title [list "user_principal_name" "target_name" "target_type" "role_name"]
+    puts [join $title $sep]
+    puts "----------------------------------------------------------------"
+    db1 eval {
+        SELECT zone.name as target_name, effective_assignment.type as target_type, role.name as role_name, aduser.upn as upn 
+        FROM effective_assignment, role, aduser, zone 
+        WHERE effective_assignment.role=role.id AND effective_assignment.aduser=aduser.id AND type='z' AND ztype="tree" AND effective_assignment.target=zone.id AND upn LIKE $filter
+        UNION 
+        SELECT computer.dnsname as target_name, effective_assignment.type as target_type, role.name as role_name, aduser.upn as upn 
+        FROM effective_assignment, role, aduser, computer 
+        WHERE effective_assignment.role=role.id AND effective_assignment.aduser=aduser.id AND type='c' AND effective_assignment.target=computer.id AND upn LIKE $filter
+        ORDER BY upn
+    } {
+        set l [list $upn $target_name $target_type $role_name]
+        puts [join $l $sep]
+    }
+}
+proc role_report {filter sep} {
+    set title [list "role_name" "zone_name" "timebox" "sysrights" "rsh"]
+    puts [join $title $sep]
+    puts "----------------------------------------------------------------"
+    db1 eval {
+        SELECT role.name as role_name, role.timebox, role.sysrights, role.rsh, zone.name as zone_name 
+        FROM role, zone 
+        WHERE role.zone=zone.id AND role.name LIKE $filter
+        ORDER BY role.name
+    } {
+        set l [list $role_name $zone_name $timebox $sysrights $rsh]
+        puts [join $l $sep]
+    }
+}
+
+proc effective_role_report {filter sep} {
+    set title [list "role_name" "target_name" "target_type"]
+    puts [join $title $sep]
+    puts "----------------------------------------------------------------"
+    db1 eval {
+        SELECT zone.name as target_name, effective_role.type as target_type, role.name as role_name 
+        FROM effective_role, role, zone 
+        WHERE effective_role.role=role.id AND type='z' AND effective_role.target=zone.id AND role_name LIKE $filter
+        UNION 
+        SELECT computer.dnsname as target_name, effective_role.type as target_type, role.name as role_name 
+        FROM effective_role, role, computer 
+        WHERE effective_role.role=role.id AND type='c' AND effective_role.target=computer.id AND role_name LIKE $filter
+        ORDER BY role_name
+    } {
+        set l [list $role_name $target_name $target_type]
+        puts [join $l $sep]
+    }
+}
+
+if {[getopt argv -db dbpath] == 0} {
+    usage
+}
+
+if {[getopt argv -report report] == 0} {
+    usage
+}
+
+set filter "%"
+getopt argv -filter filter
+set sep "|"
+getopt argv -sep sep
+sqlite3 db1 $dbpath
+if {$sep == "csv"} {set sep ","}
+if {$sep == "tab"} {set sep "\t"}
+
+if {$report == "user"} {
+    user_report $filter $sep
+} elseif {$report == "computer"} {
+    computer_report $filter $sep
+} elseif {$report == "command"} {
+    command_report $filter $sep
+} elseif {$report == "assignment"} {
+    assignment_report $filter $sep
+} elseif {$report == "special_assignment"} {
+    special_assignment_report $filter $sep
+} elseif {$report == "effective_assignment"} {
+    effective_assignment_report $filter $sep
+} elseif {$report == "role"} {
+    role_report $filter $sep
+} elseif {$report == "effective_role"} {
+    effective_role_report $filter $sep
+} else {usage}
+
+

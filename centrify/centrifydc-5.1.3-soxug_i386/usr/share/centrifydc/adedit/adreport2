@@ -1,0 +1,472 @@
+#!/bin/sh
+#
+# $Change: 108300 $
+# $Revision: #1 $
+# $DateTime: 2014/01/20 12:11:06 $
+#
+# the next line restarts using tclsh \
+exec adedit "$0" "$@"
+package require ade_lib
+package require sqlite3
+
+set SysRight_Password 1 
+set SysRight_SSO 2 
+set SysRight_AllowDisabled 4
+set SysRight_NormalShell 8
+
+proc usage {} {
+    puts {usage: adreport2.tcl -db <db path> -report <report_name> [-filter <filter>] [-value <value>] [-value2 <value2>] [-sep csv | tab | <char>]}
+	puts {    use -filter option only if you need to pass custimized search condition.}
+    puts {    valid report name and corresponding required parameters are:}
+	puts {        UserByAny -filter}
+	puts {        UserByADUser -value}
+	puts {        UserByComputer -value}
+	puts {        UserByZone -value}
+	puts {        UserByUname -value}
+	puts {        UserByUid -value}
+	puts {        UserByUserComputer -value -value2}
+	puts {        CommandByAny -filter}
+	puts {        CommandByName -value}
+	puts {        CommandByRole -value}
+	puts {        CommandByZone -value}
+	puts {        CommandByComputer -value}
+	puts {        CommandByADUser -value}
+	puts {        CommandByCmd -value}
+	puts {        CommandByUserComputer -value -value2}
+	puts {        PAMByAny -filter}
+	puts {        PAMByName -value}
+	puts {        PAMByRole -value}
+	puts {        PAMByZone -value}
+	puts {        PAMByComputer -value}
+	puts {        PAMByADUser -value}
+	puts {        PAMByUserComputer -value -value2}
+	puts {        AssignmentByAny -filter}
+	puts {        AssignmentByADUser -value}
+	puts {        AssignmentByRole -value}
+	puts {        AssignmentByZone -value}
+	puts {        AssignmentByComputerRole -value}
+	puts {        AssignmentByPrincipalType -value}
+	puts {        EffAssignmentByAny -filter}
+	puts {        EffAssignmentByADUser -value}
+	puts {        EffAssignmentByRole -value}
+	puts {        EffAssignmentByZone -value}
+	puts {        EffAssignmentByComputer -value}
+	puts {        RoleByAny -filter}
+	puts {        RoleByName -value}
+	puts {        RoleByZone -value}
+	puts {        EffRoleByAny -filter}
+	puts {        EffRoleByName -value}
+	puts {        EffRoleByZone -value}
+	puts {        EffRoleByComputer -value}
+    exit 1
+}
+
+# decode the SysRights to human readable format
+proc SysRightsText { sysright } {
+    set text ""
+    if { $sysright & $::SysRight_Password } {
+        append text "Password login and SSO,"
+    }
+    if { $sysright & $::SysRight_SSO } {
+        append text "SSO,"
+    }
+    if { $sysright & $::SysRight_AllowDisabled } {
+        append text "Allow disabled account,"
+    }
+    if { $sysright & $::SysRight_NormalShell } {
+        append text "Login with non-restricted shell,"
+    }
+    set len [string length $text]
+    if {$len > 2} {
+        return [string range $text 0 $len-2]
+    } else {
+        return $text
+    }
+}
+
+# display error and exception stack trace
+proc Error { msg stacktrace} {
+    puts "[clock format [clock seconds]] ERROR: < $msg >. Exit now."
+    if { [string length $stacktrace] != 0 } {
+        puts "Stack Trace: $stacktrace"
+    }
+    exit 1
+}
+
+proc UserByAny_report {filter sep} {
+    set title [list "zone_name" "computer_dns_name" "user_principal_name" "uname" "uid" "home" "shell" "gid" "passflag" "ssoflag" "allowflag" "shellflag" "permitflag" "auditlevel"]
+    puts [join $title $sep]
+    puts "----------------------------------------------------------------"
+    set where ""
+    if {$filter!=""} {
+        set where "WHERE $filter"
+    }
+    db1 eval "
+        SELECT zone_name, computer_name, user_upn, uname, uid, home, shell, gid, passflag, ssoflag, allowflag, shellflag, permitflag, auditlevel 
+        FROM UserView 
+        $where
+	" {
+        set l [list $zone_name $computer_name $user_upn $uname $uid $home $shell $gid $passflag $ssoflag $allowflag $shellflag $permitflag $auditlevel]
+        puts [join $l $sep]
+    }
+}
+
+proc UserByADUser_report {filter sep} {
+    UserByAny_report "user_upn LIKE '$filter' ORDER BY user_upn" $sep
+}
+
+proc UserByComputer_report {filter sep} {
+    UserByAny_report "computer_name LIKE '$filter' ORDER BY computer_name" $sep
+}
+
+proc UserByZone_report {filter sep} {
+    UserByAny_report "zone_name LIKE '$filter' ORDER BY zone_name" $sep
+}
+
+proc UserByUname_report {filter sep} {
+    UserByAny_report "uname LIKE '$filter' ORDER BY uname" $sep
+}
+
+proc UserByUid_report {filter sep} {
+    UserByAny_report "uid LIKE '$filter' ORDER BY uid" $sep
+}
+
+proc UserByUserComputer_report {filter filter2 sep} {
+    UserByAny_report "user_upn LIKE '$filter' AND computer_name LIKE '$filter2' ORDER BY user_upn, computer_name" $sep
+}
+
+proc CommandByAny_report {filter sep} {
+    set title [list "zone_name" "computer_name" "user_upn" "role_name" "cmd_name" "cmd_command" "cmd_path" "cmd_dzdo_runas" "cmd_dzsh_runas"]
+    puts [join $title $sep]
+    puts "----------------------------------------------------------------"
+    set where ""
+    if {$filter!=""} {
+        set where "WHERE $filter"
+    }
+    db1 eval "
+        SELECT zone_name, computer_name, user_upn, role_name, cmd_name, cmd_command, cmd_path, cmd_dzdo_runas, cmd_dzsh_runas 
+        FROM CommandsView
+        $where
+    " {
+        set l [list $zone_name $computer_name $user_upn $role_name $cmd_name $cmd_command $cmd_path $cmd_dzdo_runas $cmd_dzsh_runas]
+        puts [join $l $sep]
+    }
+}
+
+proc CommandByName_report {filter sep} {
+    CommandByAny_report "cmd_name LIKE '$filter' ORDER BY cmd_name" $sep
+}
+
+proc CommandByRole_report {filter sep} {
+    CommandByAny_report "role_name LIKE '$filter' ORDER BY role_name" $sep
+}
+
+proc CommandByZone_report {filter sep} {
+    CommandByAny_report "zone_name LIKE '$filter' ORDER BY zone_name" $sep
+}
+
+proc CommandByComputer_report {filter sep} {
+    CommandByAny_report "computer_name LIKE '$filter' ORDER BY computer_name" $sep
+}
+
+proc CommandByADUser_report {filter sep} {
+    CommandByAny_report "user_upn LIKE '$filter' ORDER BY user_upn" $sep
+}
+
+proc CommandByCmd_report {filter sep} {
+    CommandByAny_report "cmd_command LIKE '$filter' ORDER BY cmd_command" $sep
+}
+
+proc CommandByUserComputer_report {filter filter2 sep} {
+    CommandByAny_report "user_upn LIKE '$filter' AND computer_name LIKE '$filter2' ORDER BY user_upn, computer_name" $sep
+}
+
+proc PAMByAny_report {filter sep} {
+    set title [list "zone_name" "computer_name" "user_upn" "role_name" "pam_name" "pam_oname" "pam_desc" "pam_application"]
+    puts [join $title $sep]
+    puts "----------------------------------------------------------------"
+    set where ""
+    if {$filter!=""} {
+        set where "WHERE $filter"
+    }
+    db1 eval "
+        SELECT zone_name, computer_name, user_upn, role_name, pam_name, pam_oname, pam_desc, pam_application   
+        FROM PamView
+        $where
+    " {
+        set l [list $zone_name $computer_name $user_upn $role_name $pam_name $pam_oname $pam_desc $pam_application]
+        puts [join $l $sep]
+    }
+}
+
+proc PAMByName_report {filter sep} {
+    PAMByAny_report "pam_name LIKE '$filter' ORDER BY pam_name" $sep
+}
+
+proc PAMByRole_report {filter sep} {
+    PAMByAny_report "role_name LIKE '$filter' ORDER BY role_name" $sep
+}
+
+proc PAMByZone_report {filter sep} {
+    PAMByAny_report "zone_name LIKE '$filter' ORDER BY zone_name" $sep
+}
+
+proc PAMByComputer_report {filter sep} {
+    PAMByAny_report "computer_name LIKE '$filter' ORDER BY computer_name" $sep
+}
+
+proc PAMByADUser_report {filter sep} {
+    PAMByAny_report "user_upn LIKE '$filter' ORDER BY user_upn" $sep
+}
+
+proc PAMByUserComputer_report {filter filter2 sep} {
+    CommandByAny_report "user_upn LIKE '$filter' AND computer_name LIKE '$filter2' ORDER BY user_upn, computer_name" $sep
+}
+
+proc AssignmentByAny_report {filter sep} {
+    set title [list "zone_name" "principal_type" "user_upn" "role_name" "crole_name"]
+    puts [join $title $sep]
+    puts "----------------------------------------------------------------"
+    set where ""
+    if {$filter!=""} {
+        set where "WHERE $filter"
+    }
+    db1 eval "
+        SELECT zone_name, principal_type, user_upn, role_name, crole_name  
+        FROM AssignmentView 
+        $where
+    " {
+        set l [list $zone_name $principal_type $user_upn $role_name $crole_name]
+        puts [join $l $sep]
+    }
+}
+
+proc AssignmentByADUser_report {filter sep} {
+    AssignmentByAny_report "user_upn LIKE '$filter' ORDER BY user_upn" $sep
+}
+
+proc AssignmentByRole_report {filter sep} {
+    AssignmentByAny_report "role_name LIKE '$filter' ORDER BY role_name" $sep
+}
+
+proc AssignmentByZone_report {filter sep} {
+    AssignmentByAny_report "zone_name LIKE '$filter' ORDER BY zone_name" $sep
+}
+
+proc AssignmentByComputerRole_report {filter sep} {
+    AssignmentByAny_report "crole_name LIKE '$filter' ORDER BY crole_name" $sep
+}
+
+proc AssignmentByPrincipalType_report {filter sep} {
+    AssignmentByAny_report "principal_type LIKE '$filter' ORDER BY principal_type" $sep
+}
+
+proc EffAssignmentByAny_report {filter sep} {
+    set title [list "target_name" "target_type" "user_upn" "role_name"]
+    puts [join $title $sep]
+    puts "----------------------------------------------------------------"
+    set where ""
+    if {$filter!=""} {
+        set where "WHERE $filter"
+    }
+    db1 eval "
+        SELECT target_name, target_type, user_upn, role_name 
+        FROM EffAssignmentView 
+        $where
+    " {
+        set l [list $target_name $target_type $user_upn $role_name]
+        puts [join $l $sep]
+    }
+}
+
+proc EffAssignmentByADUser_report {filter sep} {
+    EffAssignmentByAny_report "user_upn LIKE '$filter' OR user_upn='all ad users' ORDER BY target_name" $sep
+}
+
+proc EffAssignmentByRole_report {filter sep} {
+    EffAssignmentByAny_report "role_name LIKE '$filter' ORDER BY target_name" $sep
+}
+
+proc EffAssignmentByZone_report {filter sep} {
+    EffAssignmentByAny_report "target_type = 'z' and target_name LIKE '$filter' ORDER BY target_name" $sep
+}
+
+proc EffAssignmentByComputer_report {filter sep} {
+    EffAssignmentByAny_report "target_type = 'c' and target_name LIKE '$filter' ORDER BY target_name" $sep
+}
+
+proc RoleByAny_report {filter sep} {
+    set title [list "zone_name" "role_name" "timebox" "sysrights" "rsh"]
+    puts [join $title $sep]
+    puts "----------------------------------------------------------------"
+    set where ""
+    if {$filter!=""} {
+        set where "WHERE $filter"
+    }
+    db1 eval "
+        SELECT zone_name, role_name, timebox, sysrights, rsh
+        FROM RoleView 
+        $where
+    " {
+        set l [list $zone_name $role_name $timebox [SysRightsText $sysrights] $rsh]
+        puts [join $l $sep]
+    }
+}
+
+proc RoleByName_report {filter sep} {
+    RoleByAny_report "role_name LIKE '$filter' ORDER BY role_name" $sep
+}
+
+proc RoleByZone_report {filter sep} {
+    RoleByAny_report "zone_name LIKE '$filter' ORDER BY zone_name" $sep
+}
+
+proc EffRoleByAny_report {filter sep} {
+    set title [list "target_name" "target_type" "role_name"]
+    puts [join $title $sep]
+    puts "----------------------------------------------------------------"
+    set where ""
+    if {$filter!=""} {
+        set where "WHERE $filter"
+    }
+    db1 eval "
+        SELECT target_name, target_type, role_name  
+        FROM EffRoleView 
+        $where
+    " {
+        set l [list $target_name $target_type $role_name]
+        puts [join $l $sep]
+    }
+}
+
+proc EffRoleByName_report {filter sep} {
+    EffRoleByAny_report "role_name LIKE '$filter' ORDER BY role_name" $sep
+}
+
+proc EffRoleByZone_report {filter sep} {
+    EffRoleByAny_report "target_type = 'z' and target_name LIKE '$filter' ORDER BY target_name" $sep
+}
+
+proc EffRoleByComputer_report {filter sep} {
+    EffRoleByAny_report "target_type = 'c' and target_name LIKE '$filter' ORDER BY target_name" $sep
+}
+
+# Entry point
+if {[getopt argv -db dbpath] == 0} {
+    usage
+}
+
+if {[getopt argv -report report] == 0} {
+    usage
+}
+
+set filter ""
+set value "%"
+set value2 "%"
+getopt argv -filter filter
+set sep "|"
+getopt argv -sep sep
+sqlite3 db1 $dbpath
+if {$sep == "csv"} {set sep ","}
+if {$sep == "tab"} {set sep "\t"}
+if {[regexp {Any$} $report]} {
+    # we get the general filter from command line. process the report now....
+    if { [catch { switch $report {
+        "UserByAny"
+            { UserByAny_report $filter $sep }
+        "CommandByAny"
+            { CommandByAny_report $filter $sep }
+        "PAMByAny"
+            { PAMByAny_report $filter $sep }
+        "AssignmentByAny"
+            { AssignmentByAny_report $filter $sep }
+        "EffAssignmentByAny"
+            { EffAssignmentByAny_report $filter $sep }
+        "RoleByAny"
+            { RoleByAny_report $filter $sep }
+        "EffRoleByAny"
+            { EffRoleByAny_report $filter $sep }
+        default
+            { usage }
+    } } errmsg] } {
+        # log exception
+        Error $errmsg $errorInfo
+    }
+	exit
+}
+
+# now, process report that has predefined filtering condition
+getopt argv -value2 value2
+getopt argv -value value
+
+switch $report {
+    "UserByADUser"
+        { UserByADUser_report $value $sep }
+    "UserByComputer"    
+        { UserByComputer_report $value $sep }
+    "UserByZone"    
+        { UserByZone_report $value $sep }
+    "UserByUname"    
+        { UserByUname_report $value $sep }
+    "UserByUid"    
+        { UserByUid_report $value $sep }
+    "UserByUserComputer"    
+        { UserByUserComputer_report $value $value2 $sep }
+    "CommandByName"    
+        { CommandByName_report $value $sep }
+    "CommandByRole"    
+        { CommandByRole_report $value $sep }
+    "CommandByZone"    
+        { CommandByZone_report $value $sep }
+    "CommandByComputer"    
+        { CommandByComputer_report $value $sep }
+    "CommandByADUser"    
+        { CommandByADUser_report $value $sep }
+    "CommandByCmd"    
+        { CommandByCmd_report $value $sep }
+    "CommandByUserComputer"    
+        { CommandByUserComputer_report $value $value2 $sep }
+    "PAMByName"    
+        { PAMByName_report $value $sep }
+    "PAMByRole"    
+        { PAMByRole_report $value $sep }
+    "PAMByZone"    
+        { PAMByZone_report $value $sep }
+    "PAMByComputer"    
+        { PAMByComputer_report $value $sep }
+    "PAMByADUser"    
+        { PAMByADUser_report $value $sep }
+    "PAMByUserComputer"    
+        { PAMByUserComputer_report $value $value2 $sep }
+    "AssignmentByADUser"    
+        { AssignmentByADUser_report $value $sep }
+    "AssignmentByRole"    
+        { AssignmentByRole_report $value $sep }
+    "AssignmentByZone"    
+        { AssignmentByZone_report $value $sep }
+    "AssignmentByComputerRole"    
+        { AssignmentByComputerRole_report $value $sep }
+    "AssignmentByPrincipalType"    
+        { AssignmentByPrincipalType_report $value $sep }
+    "EffAssignmentByADUser"    
+        { EffAssignmentByADUser_report $value $sep }
+    "EffAssignmentByRole"    
+        { EffAssignmentByRole_report $value $sep }
+    "EffAssignmentByZone"    
+        { EffAssignmentByZone_report $value $sep }
+    "EffAssignmentByComputer"    
+        { EffAssignmentByComputer_report $value $sep }
+    "RoleByName"    
+        { RoleByName_report $value $sep }
+    "RoleByZone"    
+        { RoleByZone_report $value $sep }
+    "EffRoleByName"    
+        { EffRoleByName_report $value $sep }
+    "EffRoleByZone"    
+        { EffRoleByZone_report $value $sep }
+    "EffRoleByComputer"    
+        { EffRoleByComputer_report $value $sep }
+    default
+        { usage }
+}
+

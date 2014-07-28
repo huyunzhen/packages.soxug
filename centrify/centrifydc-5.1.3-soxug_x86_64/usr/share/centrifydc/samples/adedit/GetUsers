@@ -1,0 +1,23 @@
+#!/bin/env adedit
+
+# GetUsers
+# Purpose: Operates on a recursive listing of all UNIX users in all 
+# Centrify Zones, and retrieves the administered UNIX attribute values 
+# for each user object in each zone.
+# 
+
+package require ade_lib
+
+puts "
+This script retrieves the UNIX attributes for each user in each zone in the specified domain"
+
+source setenv
+
+foreach ZONE [get_zones $domain] {
+	select_zone $ZONE
+	foreach USER [get_zone_users] {
+		select_zone_user $USER
+		puts  -nonewline "[gzuf uname]:[gzuf uid]:[gzuf gid]:[gzuf gecos]:[gzuf home]:[gzuf shell]"; puts :$USER:$ZONE
+	}
+}
+

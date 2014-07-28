@@ -1,0 +1,314 @@
+#!/bin/sh
+RPM_INSTALL_PREFIX=
+export RPM_INSTALL_PREFIX
+# summary of how this script can be called:
+#        * <new-preinst> `install'
+#        * <new-preinst> `install' <old-version>
+#        * <new-preinst> `upgrade' <old-version>
+#        * <old-preinst> `abort-upgrade' <new-version>
+# for details, see http://www.debian.org/doc/debian-policy/ or
+# the debian-policy package
+
+# action plan:
+#        * <new-preinst> `install'
+#          - do nothing
+#        * <new-preinst> `install' <old-version>
+#          - (configured) prepare for configuration upgrade
+#        * <new-preinst> `upgrade' <old-version>
+#          - prepare for upgrade, then prepare for configuration upgrade
+#        * <old-preinst> `abort-upgrade' <new-version>
+#          - (unwind other 'postrm failed-upgrade', unknown state) do nothing
+
+LOG_FILE=/var/log/centrifydc-install.log
+echo pre-install: 5.1.3-482: `date` >> ${LOG_FILE}
+echo "arguments:" "$@" >> ${LOG_FILE}
+
+EXPECTED_ARCH=i386
+CURRENT_ARCH="`uname -m | grep i | grep 86`"
+if [ "${CURRENT_ARCH}" = "" ]; then
+    CURRENT_ARCH="`uname -m 2> /dev/null`"
+else
+    CURRENT_ARCH="i386"
+fi
+if [ "${EXPECTED_ARCH}" != "${CURRENT_ARCH}" ]; then
+    echo "ERROR: Incompatible architecture, exiting ..." | tee -a ${LOG_FILE}
+    echo "       EXPECTED_ARCH=${EXPECTED_ARCH}" | tee -a ${LOG_FILE}
+    echo "       CURRENT_ARCH=${CURRENT_ARCH}" | tee -a ${LOG_FILE}
+    exit 1
+fi
+
+if [ "$1" = "upgrade" -a -n "$2" ]; then
+    # Prepare for upgrade
+
+    # check upgrade from 5.0.x in disconnected mode
+    UPGRADE_ENFORCEMENT_FILE="/var/centrifydc/tmp/CENTRIFY_FORCE_DISCONNECTED_UPGRADE"
+    UPGRADE_FROM_VER4_ERR_MSG="ERROR: Upgrade from CDC version 5.0.X (or below) in disconnected mode is not recommended. To force upgrade please create an empty file $UPGRADE_ENFORCEMENT_FILE."
+    UPGRADE_FROM_VER4_WARN_MSG="WARNING: Upgrade from CDC version 5.0.X (or below) in disconnnected mode is not recommended. AD user may have problem to login after upgrade."
+
+    SKIP_UPGRADE_ENFORCEMENT_TEST="NO"
+    CDC_VER_ORIG="`/usr/bin/adinfo -v | cut -d ' ' -f 3 | sed 's/[^0-9]*//g'`"
+    if [ ${CDC_VER_ORIG} -lt 510000 ]; then
+        # CDC_VER_ORIG is below 5.1.x so check if adclient is in connected mode
+        CDC_MODE="`/usr/bin/adinfo -m`"
+        if [ -n "${CDC_MODE}" ]; then
+            if [ "${CDC_MODE}" = "connected" ]; then
+                # connected mode so it is safe to perform upgrade
+                SKIP_UPGRADE_ENFORCEMENT_TEST="YES"
+            elif [ -f /var/centrifydc/upgrade/START ]; then
+                # adclient was stopped by install.sh so it is safe to perform upgrade
+                SKIP_UPGRADE_ENFORCEMENT_TEST="YES"
+            fi
+        else
+            # CDC_MODE returns nothing (not joined) so it is safe to perfrom upgrade
+            SKIP_UPGRADE_ENFORCEMENT_TEST="YES"
+        fi
+    else
+        # CDC_VER_ORIG is 5.1.x or higher so it is safe to perform upgrade
+        SKIP_UPGRADE_ENFORCEMENT_TEST="YES"
+    fi
+
+    if [ "${SKIP_UPGRADE_ENFORCEMENT_TEST}" = "NO" ]; then
+        echo " " >> ${LOG_FILE}
+        if [ -f $UPGRADE_ENFORCEMENT_FILE ]; then
+            echo "$UPGRADE_FROM_VER4_WARN_MSG" >> ${LOG_FILE}
+        else
+            # terminate upgrade
+            echo "$UPGRADE_FROM_VER4_ERR_MSG" | tee -a ${LOG_FILE}
+            echo Exiting ... | tee -a ${LOG_FILE}
+            exit 1
+        fi
+    fi
+
+    echo upgrading from `dpkg -s centrifydc | grep "^Version:" | cut -d' ' -f2` to 5.1.3-482 ... >> ${LOG_FILE}
+    mkdir -p /var/centrifydc/upgrade >> ${LOG_FILE} 2>> ${LOG_FILE}
+
+    # Our old Debian package does not handle the abort-upgrade correctly
+    # and doing upgrade in old postinst. To avoid outputting errors,
+    # before aborting (checking the DirectAudit), we need the following
+    # workaround.
+
+    # Workaround for old Debian package starts
+
+    # Make sure everyone can read the files under /var/centrifydc
+    chmod 755 /var/centrifydc >> ${LOG_FILE} 2>> ${LOG_FILE}
+
+    # should we do cache upgrading at the end ?
+    if [ ! -f /var/centrifydc/kset.domain ]; then
+        echo 'computer is not "joined", skip cache upgrading' >> ${LOG_FILE} 2>> ${LOG_FILE}
+    elif [ `/usr/bin/adinfo -c | grep 'adclient.cache.encrypt:' | grep true > /dev/null; echo $?` -eq 0 ]; then
+        echo "WARNING: cache is encrypted and it cannot be upgraded" >> ${LOG_FILE} 2>> ${LOG_FILE}
+    elif [ -x /usr/share/centrifydc/bin/adcache ]; then
+        /usr/share/centrifydc/bin/adcache -s 2>/dev/null | grep 0x > /var/centrifydc/upgrade/CHECK_SUM_ORIG
+        CDC_CUR_CHECK_SUM="`cat /var/centrifydc/upgrade/CHECK_SUM_ORIG`"
+        echo "get dictionary checksum: ${CDC_CUR_CHECK_SUM}" >> ${LOG_FILE} 2>> ${LOG_FILE}
+    fi
+
+    # About the Illegal number of CDC_VER_ORIG, we have to create the
+    # CDC_VER_ORIG file first.
+    # Remember the original cdc version
+    dpkg -s centrifydc | grep "^Version:" | cut -d' ' -f2 > /var/centrifydc/upgrade/CDC_VER_ORIG 2>> ${LOG_FILE} # full format
+    CDC_VER_ORIG="`cat /var/centrifydc/upgrade/CDC_VER_ORIG | sed 's/[^0-9]*//g'`"
+
+    # About the missing ignore files, copy the configuration files to
+    # custom directory first.
+    mkdir -p /etc/centrifydc/custom >> ${LOG_FILE} 2>> ${LOG_FILE}
+    cp -p /etc/centrifydc/*.* /etc/centrifydc/custom >> ${LOG_FILE}
+
+    # About the circular link of /usr/share/centrifydc/etc/openldap,
+    # if it is a symlink, remove it and create an empty dir. We will
+    # fix it later in old postinst (abort-upgrade) or in new postinst
+    # (configure). This workaround should not be done for new package.
+    if [ -n "${CDC_VER_ORIG}" ] && [ "${CDC_VER_ORIG}" -lt "502000" ]; then
+        echo "applying workaround for openldap configuration upgrade ..." >> ${LOG_FILE}
+        if [ -h /usr/share/centrifydc/etc/openldap ]; then
+            rm -Rf /usr/share/centrifydc/etc/openldap >> ${LOG_FILE} 2>> ${LOG_FILE}
+            mkdir -p /usr/share/centrifydc/etc/openldap >> ${LOG_FILE} 2>> ${LOG_FILE}
+        fi
+    fi
+
+    # Workaround for old Debian package ends
+
+    # check DirectAudit status
+    if [ -x /usr/sbin/dacontrol ] && [ -x /usr/bin/dainfo ]; then
+        CDA_CUR_VER="`/usr/bin/dainfo -v  | cut -d' ' -f3 | cut -d- -f1`"
+        echo CDA_CUR_VER=${CDA_CUR_VER} >> ${LOG_FILE}
+
+    TRUE=0; FALSE=1;      # shell uses negative logic.
+    if [ `echo ${CDA_CUR_VER} | cut -d'.' -f1` -ge 3 ]; then
+        # DA v.3+ supports NSS
+        DA_NSS=$TRUE
+        if [ `/usr/bin/dainfo -s > /dev/null 2>&1; echo $?` -ne 0 ]; then
+            echo "INFO: Centrify DirectAudit auditing is currently enabled (symlink hooked)." >> ${LOG_FILE}
+            IS_AUDITING=$TRUE
+        else
+            IS_AUDITING=$FALSE
+        fi
+    else
+        # fallback to old DA CLI
+        DA_NSS=$FALSE
+        echo checking DirectAudit status ... >> ${LOG_FILE}
+        list=`/usr/bin/dainfo`
+
+        IFS_ORG="${IFS}"
+        if [ -n "`echo -e "\n"`" ]; then
+            IFS=$"`echo '\012\001'`"
+        else
+            IFS=$'\012'
+        fi
+        IS_AUDITING=$FALSE
+        IN_AUDITING_LIST=$FALSE
+
+        for e in $list
+        do
+            # loop until the begining of the enabled list
+            if [ $IN_AUDITING_LIST -eq $FALSE ]; then
+                echo $e | grep "is enabled on the following" > /dev/null
+                if [ $? -eq 0 ]; then
+                    IN_AUDITING_LIST=$TRUE
+                fi
+                continue
+            fi
+
+            # if we come to the end of the auditing list without encounter any audited shell
+            echo $e | grep "is NOT enabled on the following" > /dev/null
+            if [ $? -eq 0 ]; then
+                IS_AUDITING=$FALSE
+                break
+            fi
+
+            # if the line is not begins with a space, it is not one the result
+            echo $e | grep "^ " > /dev/null
+            if [ $? -eq 1 ]; then
+                continue
+            fi
+
+            # if the line ends with '/dash', there is a chance that it is not an
+            # audited shell, but only due to the name conflict
+            echo $e | grep "/dash$" > /dev/null
+            if [ $? -eq 0 ]; then
+                # Is it a link?
+                if [ ! -h $e ]; then
+                    # Not a link, but report as auditing. Sign of affected by conflict. Skip it
+                    continue
+                fi
+            fi
+
+            IS_AUDITING=$TRUE
+            break
+        done
+        IFS="${IFS_ORG}"
+    fi
+
+        if [ ${IS_AUDITING} -eq $FALSE ]; then
+            if [ ${DA_NSS} -eq $TRUE ]; then
+                /usr/sbin/dacontrol --cdashContWithoutDad >> ${LOG_FILE} 2>> ${LOG_FILE}
+            else
+                echo DirectAudit is not enabled >> ${LOG_FILE}
+            fi
+        else
+            echo Upgrading from ${CDA_CUR_VER} requires disabling DirectAudit so that the new | tee -a ${LOG_FILE}
+            echo DirectAudit mechanism for hooking shells can be installed. | tee -a ${LOG_FILE}
+            echo "Please run 'dacontrol -d -a' to disable auditing, and then restart upgrading." | tee -a ${LOG_FILE}
+            echo Exiting ... | tee -a ${LOG_FILE}
+            exit 1
+        fi
+    fi
+
+    for tries in 1 2 3; do
+        dcPid=`ps -ae | awk '$4 ~ /^adclient$/ { print $1; }'`
+        if [ ! -z "$dcPid" ]; then
+            touch /var/centrifydc/upgrade/START >> ${LOG_FILE}
+            CDCWATCH_PID=`ps -ef | grep -w cdcwatch | grep -v tmp | grep -v grep | awk '{ print $2 }'`
+            test -n "$CDCWATCH_PID" && kill $CDCWATCH_PID >> ${LOG_FILE} 2>> ${LOG_FILE}
+            case "$tries" in 
+                1) 
+                    echo stop adclient by centrifydc stop ... >> ${LOG_FILE}
+                    /usr/share/centrifydc/bin/centrifydc stop >> ${LOG_FILE} 2>> ${LOG_FILE}
+                    ;;
+                2)
+                    echo stop adclient by init.d stop ... >> ${LOG_FILE}
+                    /etc/init.d/centrifydc stop >> ${LOG_FILE} 2>> ${LOG_FILE}
+                    ;;
+                3) echo stop adclient by kill ... >> ${LOG_FILE}
+                    kill -9 $dcPid >> ${LOG_FILE} 2>> ${LOG_FILE}
+                    ;;
+            esac
+            sleep 2
+        else 
+            echo Directive Control daemon status: not running ... >> ${LOG_FILE}
+            break
+        fi
+    done
+
+    # Stop Centrify-KCM if it's running
+    if [ -x /usr/share/centrifydc/bin/centrify-kcm ]; then
+        for tries in 1 2 3; do
+            kcmPid=`/usr/share/centrifydc/bin/centrify-kcm status | grep "is running" | sed -e 's/^.*(pid //' -e 's/).*$//'`
+            if [ ! -z "$kcmPid" ]; then
+                case "$tries" in 
+                    1) 
+                        echo stop Centrify-KCM by centrify-kcm stop ... >> ${LOG_FILE}
+                        /usr/share/centrifydc/bin/centrify-kcm stop >> ${LOG_FILE} 2>> ${LOG_FILE}
+                        ;;
+                    2)
+                        echo stop Centrify-KCM by init.d stop ... >> ${LOG_FILE}
+                        invoke-rc.d centrify-kcm stop >> ${LOG_FILE} 2>> ${LOG_FILE}
+                        ;;
+                    3) echo stop Centrify-KCM by kill ... >> ${LOG_FILE}
+                        kill -9 $kcmPid >> ${LOG_FILE} 2>> ${LOG_FILE}
+                        ;;
+                esac
+                sleep 2
+            else 
+                echo Centrify-KCM is not running. >> ${LOG_FILE}
+                break
+            fi
+        done
+    fi
+
+    # remove pid file to avoid cache flush when adclient starts next time
+    rm -f /var/run/adclient.pid
+
+    if [ -f /usr/share/centrifydc/mappers/user/filemounts.pl ]; then
+        rm -f /usr/share/centrifydc/mappers/user/filemounts.pl
+    fi
+
+    if [ -f /etc/nsswitch.conf.pre_cdc ]; then
+         echo backing out /etc/nsswitch.conf ... >> ${LOG_FILE}
+         mv /etc/nsswitch.conf /etc/nsswitch.conf.upgrade >> ${LOG_FILE} 2>> ${LOG_FILE}
+         cp /etc/nsswitch.conf.pre_cdc /etc/nsswitch.conf >> ${LOG_FILE} 2>> ${LOG_FILE}
+    fi
+
+    if [ -s /etc/centrifydc/openldap/ldap.conf ]; then
+        echo preserving /etc/centrifydc/openldap/ldap.conf ... >> ${LOG_FILE}
+        cp /etc/centrifydc/openldap/ldap.conf /etc/centrifydc/openldap/ldap.conf.cdc_upgrade >> ${LOG_FILE} 2>> ${LOG_FILE}
+    elif [ -s /usr/share/centrifydc/etc/openldap/ldap.conf ]; then
+        echo preserving /usr/share/centrifydc/etc/openldap/ldap.conf ... >> ${LOG_FILE}
+        cp /usr/share/centrifydc/etc/openldap/ldap.conf /usr/share/centrifydc/etc/openldap/ldap.conf.cdc_upgrade >> ${LOG_FILE} 2>> ${LOG_FILE}
+    fi
+
+    # if /usr/share/centrifydc/etc/openldap is already a symlink to
+    # /etc/centrifydc/openldap, we MUST remove it here. Otherwise,
+    # /etc/centrifydc/openldap/ldap.conf will be overwritten with
+    # a symlink from our package. Even worst, this will produce
+    # a circular link. Because if the CDC is upgraded once, we have:
+    #   /usr/share/centrifydc/etc/openldap -> /etc/centrifydc/openldap
+    #   /usr/share/centrifydc/etc/openldap/ldap.conf (real conf file)
+    # Then, when upgrade the 2nd time, it becomes:
+    #   /usr/share/centrifydc/etc/openldap -> /etc/centrifydc/openldap
+    #   /usr/share/centrifydc/etc/openldap/ldap.conf -> \
+    #     /etc/centrifydc/openldap/ldap.conf
+    # That is pointing to itself actually.
+    #
+    # Note that only Debian will follow dir that's a symlink, therefore
+    # this problem should not exist on other Linuxes.
+    #
+    # For more info about the openldap configuration, please see
+    # bug 10169 and 13547.
+    # 
+    if [ -h /usr/share/centrifydc/etc/openldap ]; then
+        rm /usr/share/centrifydc/etc/openldap
+    fi
+fi
+
+exit 0

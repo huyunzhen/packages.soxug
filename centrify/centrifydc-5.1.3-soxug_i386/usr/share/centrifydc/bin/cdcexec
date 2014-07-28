@@ -1,0 +1,7 @@
+#! /bin/sh
+
+unset _ 
+LD_LIBRARY_PATH=/usr/share/centrifydc/lib:/usr/share/centrifydc/kerberos/lib
+export LD_LIBRARY_PATH
+CDCEXEC=`basename $0`
+exec /usr/share/centrifydc/libexec/$CDCEXEC "$@"

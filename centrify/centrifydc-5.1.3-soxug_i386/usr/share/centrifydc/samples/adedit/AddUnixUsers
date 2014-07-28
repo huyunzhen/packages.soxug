@@ -1,0 +1,64 @@
+#!/bin/env adedit
+
+# This script creates an AD account for each user the specified 
+# and adds the user to UNIX Users group. This automatically fills in their UNIX profile. 
+
+# Command line input: file name w/ user names in format ffff.llll only 
+# Prompted input: domain, administrator name, default password
+
+package require ade_lib
+
+if { $argc != 1 } {
+	puts "usage: $argv0 file"
+	exit 1
+}
+
+if {[catch {set users [open [lindex $argv 0] r]} errmsg]} { 
+	puts "Cannot open [lindex $argv 0]."
+	exit 1
+}
+
+# Get domain and bind
+
+puts "Enter domain name"
+gets stdin domain 
+
+set domaindn [dn_from_domain $domain]
+
+puts "Enter account name with administrator privileges"
+gets stdin administrator
+
+puts "Enter $administrator password"
+gets stdin APWD
+
+bind $domain $administrator "$APWD"
+
+puts "
+Define password to be used for all accounts"
+
+gets stdin pwd
+
+# Now start creating accounts from users 
+
+# example: "cn=Ellen Edwards,cn=Users,$domaindn" "Ellen.Edwards@$domain" ellen.edwards pwd
+
+while {[gets $users sam] >= 0} {
+	set name [split $sam .]
+	set dn "cn=[lindex $name 0] [lindex $name 1],cn=Users,$domaindn"
+	set upn $sam@$domain
+    if { [catch { select_object $dn }] } {
+        # If we fail to select the object, most probably it
+        # does not exist. So we create it here.
+        puts "Creating $dn"
+        create_aduser $dn $upn $sam $pwd
+    } else {
+        puts "$dn exists. Skip creating."
+    }
+    
+# 	Because we already installed and started ZPA, this provisions the AD account
+    catch { add_user_to_group $sam@$domain "UNIX Users@$domain" }
+}
+
+
+close $users
+

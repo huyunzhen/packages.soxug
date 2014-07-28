@@ -1,0 +1,38 @@
+#!/bin/env adedit
+
+# This script takes a domain name and optionally user name and password
+# and binds the user to the specified domain.
+# If the user does not specify a user name or password, she is prompted.  
+#
+#
+
+package require ade_lib
+
+proc usage {msg} {
+	puts {usage: -d <domain> [-u <user>] [-p <password>]}
+	puts $msg
+	exit 1
+}
+
+if {[getopt argv -d domain] == 0} {
+
+	usage "Missing Domain, ex. centrify.demo"
+}
+
+
+if {[getopt argv -u user] != 0} {
+
+      if {[getopt argv -p password]} {
+	bind $domain $user $password
+
+       } else {
+        bind $domain $user} 
+	} else {
+    puts "Enter administrator name:"
+	gets stdin user
+	bind $domain $user
+}
+
+puts "
+Binding complete to $domain.  "
+

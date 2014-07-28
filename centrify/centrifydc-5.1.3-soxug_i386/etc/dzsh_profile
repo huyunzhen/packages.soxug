@@ -1,0 +1,18 @@
+#!/usr/bin/dzsh
+
+# 
+# systemwide dzsh startup file, executed per interactive shell
+# 
+
+ID=id
+OS=`uname`
+if [ "$OS" = "SunOS" ] ; then 
+    ID=/usr/xpg4/bin/id
+fi
+
+# set prompt 
+if [ "`$ID -u`" = "0" ] ; then
+export PS1="dzsh ${LOGNAME} # "
+else
+export PS1="dzsh ${LOGNAME} $ "
+fi

@@ -1,0 +1,22 @@
+#!/bin/sh /usr/share/centrifydc/perl/run
+# A demo for Dzdo Validator.
+
+use strict;
+
+use lib "../perl";
+use lib '/usr/share/centrifydc/perl';
+use CentrifyDC::Logger;
+
+my $dzdo_user=$ENV{DZDO_USER};
+my $dzdo_command=$ENV{DZDO_COMMAND};
+my $dzdo_runasuser=$ENV{DZDO_RUNASUSER};
+
+printf STDERR "Enter the change control ticket number:";
+my $user_input=<>;
+`adsendaudittrailevent -t "tkt_id" -i "$user_input"`;
+my $logger = CentrifyDC::Logger->new('dzcheck');
+
+$logger->log('INFO', "Change control ticket number: %s", $user_input);
+$logger->log('INFO', "User \"%s\" will run \"%s\" as \"%s\" with ticket number \"%s\"", $dzdo_user, $dzdo_command, $dzdo_runasuser, $user_input);
+
+exit 0;

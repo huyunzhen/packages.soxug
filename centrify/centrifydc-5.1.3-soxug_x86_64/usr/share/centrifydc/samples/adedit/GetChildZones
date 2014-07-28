@@ -1,0 +1,22 @@
+#!/bin/env adedit
+
+# # GetChildZones
+# Purpose: Retrieves a recursive listing of all new hierarchical Centrify child 
+# zones administered underneath the parent zone specified in setenv 
+#
+#
+package require ade_lib
+
+source setenv
+
+puts "
+This script retrieves a recursive listing of all child zones in $parentZone"
+
+puts "
+The Active Directory folder with the Centrify zone information is $zonesContainer"
+
+
+select_zone "CN=$parentZone,CN=$zonesContainer,OU=$zonesContainerOU,$domaindn"
+foreach ZONE [get_child_zones -tree] {
+	puts $ZONE;
+}

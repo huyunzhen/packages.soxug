@@ -1,0 +1,71 @@
+#!/bin/env adedit
+
+# This script lists the managed computers in the zone.
+
+# Command line input is the domain, the administrator account name and 
+# the separator to use between computer's field values in the output
+
+package require ade_lib
+
+# Lists all of the managed computers and the zone
+
+proc usage {msg} {
+	puts {usage: -domain <domain> [-m] [-u <user>] [-p <password>] [-sep csv | tab | <char>]}
+	puts $msg
+	exit 1
+}
+if {[getopt argv -domain domain] == 0} {
+	usage "Missing domain"
+}
+set verbose 0
+if {[getopt argv -v]} {
+	set verbose 1
+}
+set sep "|"
+getopt argv -sep sep
+if {$sep == "csv"} {set sep ","}
+if {$sep == "tab"} {set sep "\t"}
+
+if {[getopt argv -m]} {
+	bind -gc -machine $domain 
+} else { 
+   if {[getopt argv -u user]} {
+      if {[getopt argv -p password]} {
+	bind -gc $domain $user $password
+       } else {
+        bind -gc $domain $user} 
+	} else {
+    bind -gc $domain
+  }
+}
+
+# this code runs entirely off the GC
+cache on
+set scps [get_objects -gc -depth sub [dn_from_domain $domain] {(&(displayName=$CimsComputerVersion*)(objectClass=serviceConnectionPoint))}]
+foreach scp $scps {
+	slo -gc $scp
+	set name [gof name]
+	set parent ""
+	# first look for parentLink
+	foreach k [gof keywords] {
+		set bits [split $k ':']
+		if {[lindex $bits 0] == "parentLink"} {
+			set sid [lindex $bits 1]
+			#ok we got it
+			# make sure it exists
+			catch {set parent [principal_from_sid $sid]}
+		}
+	}
+	# if we didn't then try by managed By (DC3)
+	if {$parent == ""} {
+		set mb [gof managedBy]
+		if {$mb != ""} {
+		   set parent $mb
+		}
+	}
+	set orphan 0
+	if {$parent == ""} {set orphan 1}
+	set path [get_parent_dn [get_parent_dn [gof dn]]]
+	set zone [string range [get_rdn $path] 3 end]
+	puts $name$sep$zone$sep$orphan
+}
