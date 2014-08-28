@@ -1,0 +1,10 @@
+Package: xug-default-settings
+Version: 12.04-6
+Architecture: all
+Maintainer: CIXUG Developers <osl@cixug.es>
+Installed-Size: 43
+Depends: dconf-gsettings-backend | gsettings-backend, libglib2.0-bin, xug-look
+Section: x11
+Priority: optional
+Description: default settings for the Ubuntu.xug desktop
+ This package contains the default settings used by the Ubuntu.xug.
