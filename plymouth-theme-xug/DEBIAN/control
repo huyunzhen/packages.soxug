@@ -1,0 +1,15 @@
+Package: plymouth-theme-xug
+Source: xug-look
+Version: 0.2
+Architecture: all
+Maintainer: CIXUG Developers <osl@cixug.es>
+Installed-Size: 109
+Depends: plymouth, plymouth-label
+Conflicts: xug-plymouth-theme
+Replaces: xug-plymouth-theme
+Provides: plymouth-theme
+Section: x11
+Priority: optional
+Description: Ubuntu.xug Plymouth theme
+ .
+ This package contains the Ubuntu.xug Plymouth boot splash theme
