@@ -30,4 +30,4 @@ background='/usr/share/backgrounds/ubuntu-xug/os.xug-wallpaper-2-logos.png'
 logo=''
 
 [com.canonical.Unity.Launcher]
-favorites = ['application://nautilus-home.desktop', 'application://firefox.desktop', 'application://libreoffice-writer.desktop', 'application://libreoffice-calc.desktop', 'application://libreoffice-impress.desktop', 'unity://running-apps', 'unity://expo-icon', 'unity://devices']
+favorites = [ 'nautilus-home.desktop', 'firefox.desktop', 'libreoffice-writer.desktop', 'libreoffice-calc.desktop', 'libreoffice-impress.desktop', 'gimp.desktop', 'vlc.desktop' ]
