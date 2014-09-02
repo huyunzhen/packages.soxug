@@ -1,0 +1,25 @@
+#! /bin/sh
+
+set -e
+
+case "$1" in
+  configure|upgrade)
+
+# Configuramos o CRAN da OSL, e activamos o español como idioma por defecto
+cat << EOF >> /etc/R/Rprofile.site
+options(repos="http://ftp.cixug.es/CRAN")
+Sys.setlocale(category = "LC_MESSAGES",locale="es_ES.UTF-8")
+EOF
+
+# Instalamos os paquetes adicionais
+
+	wget ftp://ftp.cixug.es/R/packages/abind_1.4-0.tar.gz -P /tmp
+	R CMD INSTALL /tmp/abind_1.4-0.tar.gz
+
+# Eliminamos os ficheiros descargados
+	rm /tmp/*.tar.gz
+
+    ;;
+esac
+
+

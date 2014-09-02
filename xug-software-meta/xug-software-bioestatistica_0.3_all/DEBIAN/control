@@ -1,0 +1,12 @@
+Package: xug-software-bioestatistica
+Source: xug-software-meta
+Version: 0.3
+Architecture: all
+Maintainer: CIXUG Developers <osl@cixug.es>
+Installed-Size: 25
+Depends: r-base (>= 3.1.0), r-base-dev
+Section: metapackage
+Priority: optional
+Description: Metapackage with apps and tools for Biostatistic studies
+ This package installs all the needed software on the
+ Biostatistics studies
